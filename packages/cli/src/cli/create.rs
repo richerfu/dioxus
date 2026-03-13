@@ -2,9 +2,21 @@ use super::*;
 use crate::TraceSrc;
 use anyhow::{bail, Context};
 use cargo_generate::{GenerateArgs, TemplatePath, Vcs};
+use regex::Regex;
 use std::{fs, path::Path};
 
 pub(crate) static DEFAULT_TEMPLATE: &str = "gh:dioxuslabs/dioxus-template";
+const OHOS_ABILITY_REPO: &str = "https://github.com/harmony-contrib/openharmony-ability.git";
+const OHOS_NAPI_VERSION: &str = "=1.1.6";
+const OHOS_README_SECTION: &str = r#"
+## OpenHarmony
+
+This project includes the OpenHarmony entrypoint required by Dioxus.
+
+```bash
+dx serve --ohos
+```
+"#;
 
 #[derive(Clone, Debug, Default, Deserialize, Parser)]
 #[clap(name = "new")]
@@ -177,6 +189,9 @@ pub(crate) fn post_create(path: &Path, vcs: &Vcs) -> Result<()> {
         std::fs::write(cargo_toml_path, cargo_toml.to_string()).ok()
     });
 
+    // Apply Dioxus default scaffold tweaks before formatting.
+    adapt_ohos_scaffold(path)?;
+
     // 2. Run `cargo fmt` on the new project.
     let mut cmd = Command::new("cargo");
     let cmd = cmd.arg("fmt").current_dir(path);
@@ -218,9 +233,233 @@ pub(crate) fn post_create(path: &Path, vcs: &Vcs) -> Result<()> {
         vcs.initialize(path, Some("main"), true)?;
     }
 
-    tracing::info!(dx_src = ?TraceSrc::Dev, "Generated project at {}\n\n`cd` to your project and run `dx serve` to start developing.\nMore information is available in the generated `README.md`.\n\nBuild cool things! ✌️", path.display());
+    tracing::info!(
+        dx_src = ?TraceSrc::Dev,
+        "Generated project at {}\n\n`cd` to your project and run `dx serve` to start developing.\nMore information is available in the generated `README.md`.\n\nBuild cool things! ✌️",
+        path.display(),
+    );
 
     Ok(())
+}
+
+fn adapt_ohos_scaffold(path: &Path) -> Result<()> {
+    update_ohos_cargo_toml(path)?;
+    let has_public_app = update_ohos_main_rs(path)?;
+    write_ohos_lib_rs(path, has_public_app)?;
+    write_ohos_build_rs(path)?;
+    append_ohos_readme(path)?;
+    Ok(())
+}
+
+fn update_ohos_cargo_toml(path: &Path) -> Result<()> {
+    let cargo_toml_path = path.join("Cargo.toml");
+    let cargo_toml = std::fs::read_to_string(&cargo_toml_path)
+        .with_context(|| format!("failed to read {}", cargo_toml_path.display()))?;
+    let mut doc = cargo_toml
+        .parse::<toml_edit::DocumentMut>()
+        .with_context(|| format!("failed to parse {}", cargo_toml_path.display()))?;
+
+    let lib = ensure_table(&mut doc["lib"]);
+    if !lib.contains_key("crate-type") {
+        lib["crate-type"] = array_item(["cdylib"]);
+    }
+
+    let features = ensure_table(&mut doc["features"]);
+    if !features.contains_key("mobile") {
+        features["mobile"] = array_item(["dioxus/mobile"]);
+    }
+
+    let target = ensure_table(&mut doc["target"]);
+    let ohos_target = ensure_child_table(target, r#"cfg(target_env = "ohos")"#);
+    let ohos_dependencies = ensure_child_table(ohos_target, "dependencies");
+    upsert_inline_dep(
+        ohos_dependencies,
+        "openharmony-ability",
+        &[
+            ("git", toml_edit::Value::from(OHOS_ABILITY_REPO)),
+            ("features", array_value(["webview"])),
+        ],
+    );
+    upsert_inline_dep(
+        ohos_dependencies,
+        "openharmony-ability-derive",
+        &[("git", toml_edit::Value::from(OHOS_ABILITY_REPO))],
+    );
+    upsert_string_dep(ohos_dependencies, "napi-ohos", OHOS_NAPI_VERSION);
+    upsert_string_dep(ohos_dependencies, "napi-derive-ohos", OHOS_NAPI_VERSION);
+
+    let build_dependencies = ensure_table(&mut doc["build-dependencies"]);
+    upsert_string_dep(build_dependencies, "napi-build-ohos", OHOS_NAPI_VERSION);
+
+    std::fs::write(&cargo_toml_path, doc.to_string())
+        .with_context(|| format!("failed to write {}", cargo_toml_path.display()))?;
+    Ok(())
+}
+
+fn update_ohos_main_rs(path: &Path) -> Result<bool> {
+    let main_rs_path = path.join("src").join("main.rs");
+    let main_rs = std::fs::read_to_string(&main_rs_path)
+        .with_context(|| format!("failed to read {}", main_rs_path.display()))?;
+
+    if main_rs.contains("pub fn App(")
+        || main_rs.contains("pub(crate) fn App(")
+        || main_rs.contains("pub(super) fn App(")
+    {
+        return Ok(true);
+    }
+
+    let app_fn_regex =
+        Regex::new(r"(?m)^fn\s+App\s*\(").expect("App component regex should compile");
+    if !app_fn_regex.is_match(&main_rs) {
+        tracing::warn!(
+            dx_src = ?TraceSrc::Dev,
+            "Skipping automatic OpenHarmony App export because `src/main.rs` does not define `fn App(...)`."
+        );
+        return Ok(false);
+    }
+
+    let rewritten = app_fn_regex.replace(&main_rs, "pub fn App(").to_string();
+    std::fs::write(&main_rs_path, rewritten)
+        .with_context(|| format!("failed to write {}", main_rs_path.display()))?;
+    Ok(true)
+}
+
+fn write_ohos_lib_rs(path: &Path, has_public_app: bool) -> Result<()> {
+    let lib_rs_path = path.join("src").join("lib.rs");
+    let contents = if has_public_app {
+        r#"#![cfg_attr(not(target_env = "ohos"), allow(dead_code))]
+
+#[path = "main.rs"]
+mod main_app;
+
+#[cfg(target_env = "ohos")]
+use dioxus::{
+    mobile::{
+        tao::event_loop::EventLoopBuilder,
+        tao::platform::ohos::EventLoopBuilderExtOpenHarmony,
+        Config,
+        UserWindowEvent,
+    },
+    LaunchBuilder,
+};
+#[cfg(target_env = "ohos")]
+use openharmony_ability::OpenHarmonyApp;
+#[cfg(target_env = "ohos")]
+use openharmony_ability_derive::ability;
+
+#[cfg(target_env = "ohos")]
+#[ability(webview, protocol = "dioxus")]
+fn openharmony(app: OpenHarmonyApp) {
+    let event_loop = EventLoopBuilder::<UserWindowEvent>::with_user_event()
+        .with_openharmony_app(app)
+        .build();
+
+    let config = Config::new().with_event_loop(event_loop);
+
+    LaunchBuilder::new().with_cfg(config).launch(main_app::App);
+}
+"#
+    } else {
+        r#"#[cfg(target_env = "ohos")]
+compile_error!(
+    "OpenHarmony scaffolding requires a public `App` component in `src/main.rs`. \
+Add `pub fn App() -> Element` or replace `src/lib.rs` with your own OpenHarmony entrypoint."
+);
+"#
+    };
+
+    std::fs::write(&lib_rs_path, contents)
+        .with_context(|| format!("failed to write {}", lib_rs_path.display()))?;
+    Ok(())
+}
+
+fn write_ohos_build_rs(path: &Path) -> Result<()> {
+    let build_rs_path = path.join("build.rs");
+    std::fs::write(
+        &build_rs_path,
+        r#"fn main() {
+    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ENV");
+
+    if std::env::var("CARGO_CFG_TARGET_ENV").ok().as_deref() == Some("ohos") {
+        napi_build_ohos::setup();
+    }
+}
+"#,
+    )
+    .with_context(|| format!("failed to write {}", build_rs_path.display()))?;
+    Ok(())
+}
+
+fn append_ohos_readme(path: &Path) -> Result<()> {
+    let readme_path = path.join("README.md");
+    let Ok(readme) = std::fs::read_to_string(&readme_path) else {
+        return Ok(());
+    };
+
+    if readme.contains("dx serve --ohos") {
+        return Ok(());
+    }
+
+    let mut updated = readme;
+    if !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(OHOS_README_SECTION);
+
+    std::fs::write(&readme_path, updated)
+        .with_context(|| format!("failed to write {}", readme_path.display()))?;
+    Ok(())
+}
+
+fn ensure_table(item: &mut toml_edit::Item) -> &mut toml_edit::Table {
+    if !item.is_table() {
+        *item = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    item.as_table_mut().expect("item should be a table")
+}
+
+fn ensure_child_table<'a>(parent: &'a mut toml_edit::Table, key: &str) -> &'a mut toml_edit::Table {
+    if !parent.contains_key(key) {
+        parent[key] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    parent[key]
+        .as_table_mut()
+        .expect("child item should be a table")
+}
+
+fn array_item<const N: usize>(values: [&str; N]) -> toml_edit::Item {
+    toml_edit::Item::Value(array_value(values))
+}
+
+fn array_value<const N: usize>(values: [&str; N]) -> toml_edit::Value {
+    let mut array = toml_edit::Array::default();
+    for value in values {
+        array.push(value);
+    }
+    toml_edit::Value::from(array)
+}
+
+fn upsert_string_dep(table: &mut toml_edit::Table, key: &str, version: &str) {
+    if !table.contains_key(key) {
+        table[key] = toml_edit::value(version);
+    }
+}
+
+fn upsert_inline_dep(
+    table: &mut toml_edit::Table,
+    key: &str,
+    entries: &[(&str, toml_edit::Value)],
+) {
+    if table.contains_key(key) {
+        return;
+    }
+
+    let mut inline = toml_edit::InlineTable::default();
+    for (entry_key, value) in entries {
+        inline.insert(*entry_key, value.clone());
+    }
+
+    table[key] = toml_edit::Item::Value(toml_edit::Value::InlineTable(inline));
 }
 
 fn remove_triple_newlines(string: &str) -> String {
@@ -278,6 +517,80 @@ pub(crate) async fn check_connectivity() -> Result<()> {
     bail!(
         "Error connecting to template repository. Try cloning the template manually or add `dioxus` to a `cargo new` project."
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adapt_ohos_scaffold_adds_required_files_and_dependencies() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::create_dir_all(dir.path().join("src"))?;
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            r#"[package]
+name = "hello-ohos"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dioxus = { version = "0.7.0", features = [] }
+
+[features]
+default = ["web"]
+web = ["dioxus/web"]
+desktop = ["dioxus/desktop"]
+"#,
+        )?;
+        std::fs::write(
+            dir.path().join("src").join("main.rs"),
+            r#"use dioxus::prelude::*;
+
+fn main() {
+    dioxus::launch(App);
+}
+
+#[component]
+fn App() -> Element {
+    rsx! {
+        div { "hello" }
+    }
+}
+"#,
+        )?;
+        std::fs::write(dir.path().join("README.md"), "# Demo\n")?;
+
+        adapt_ohos_scaffold(dir.path())?;
+
+        let cargo_toml = std::fs::read_to_string(dir.path().join("Cargo.toml"))?;
+        assert!(cargo_toml.contains("crate-type = [\"cdylib\"]"));
+        assert!(cargo_toml.contains("mobile = [\"dioxus/mobile\"]"));
+        assert!(cargo_toml.contains("openharmony-ability"));
+        assert!(cargo_toml.contains("napi-build-ohos"));
+
+        let parsed = cargo_toml.parse::<toml_edit::DocumentMut>()?;
+        assert!(
+            parsed["target"][r#"cfg(target_env = "ohos")"#]["dependencies"]
+                .as_table()
+                .is_some()
+        );
+
+        let main_rs = std::fs::read_to_string(dir.path().join("src").join("main.rs"))?;
+        assert!(main_rs.contains("pub fn App()"));
+
+        let lib_rs = std::fs::read_to_string(dir.path().join("src").join("lib.rs"))?;
+        assert!(lib_rs.contains(r#"#[path = "main.rs"]"#));
+        assert!(lib_rs.contains("with_openharmony_app"));
+
+        let build_rs = std::fs::read_to_string(dir.path().join("build.rs"))?;
+        assert!(build_rs.contains("napi_build_ohos::setup();"));
+
+        let readme = std::fs::read_to_string(dir.path().join("README.md"))?;
+        assert!(readme.contains("dx serve --ohos"));
+
+        Ok(())
+    }
 }
 
 // todo: re-enable these tests with better parallelization
