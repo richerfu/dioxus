@@ -1,0 +1,11 @@
+import { NativeAbility } from '@ohos-rs/ability'
+import Want from '@ohos.app.ability.Want'
+import { AbilityConstant } from '@kit.AbilityKit';
+
+export default class EntryAbility extends NativeAbility {
+  public moduleName: string = "{{module_name}}"
+
+  async onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): Promise<void> {
+    await super.onCreate(want, launchParam);
+  }
+}

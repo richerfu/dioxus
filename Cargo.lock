@@ -5446,6 +5446,7 @@ dependencies = [
  "ndk 0.9.0",
  "ndk-context",
  "ndk-sys 0.6.0+11769913",
+ "openharmony-ability",
  "percent-encoding",
  "serde_json",
  "thiserror 2.0.18",
@@ -12628,6 +12629,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "225be105b169f45a2bca86498988c1877568d82542c013b345d605eb915e48ae"
 
 [[package]]
+name = "ohos-resource-manager-binding"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33793d5fc06cf356b3d25aa6228785e62c9f2a0e913a2c285b1eb8efb7185b5e"
+dependencies = [
+ "napi-ohos",
+ "ohos-resource-manager-sys",
+]
+
+[[package]]
+name = "ohos-resource-manager-sys"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97398d3f86b80279f062bd872e04be851fc9e0eb1dba4dcaabef872201517ff6"
+dependencies = [
+ "napi-sys-ohos",
+]
+
+[[package]]
 name = "ohos-web-binding"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12766,7 +12786,7 @@ dependencies = [
 [[package]]
 name = "openharmony-ability"
 version = "0.3.0"
-source = "git+https://github.com/harmony-contrib/openharmony-ability.git#e199743a59ceb8c155856f233ca2d1762cfe5733"
+source = "git+https://github.com/harmony-contrib/openharmony-ability.git#595f63b33faa6e68149670ef200cde9b79b80f91"
 dependencies = [
  "futures-channel",
  "http 1.4.0",
@@ -12775,6 +12795,7 @@ dependencies = [
  "ohos-arkui-binding",
  "ohos-display-binding",
  "ohos-ime-binding",
+ "ohos-resource-manager-binding",
  "ohos-web-binding",
  "ohos-xcomponent-binding",
 ]
@@ -12782,7 +12803,7 @@ dependencies = [
 [[package]]
 name = "openharmony-ability-derive"
 version = "0.3.0"
-source = "git+https://github.com/harmony-contrib/openharmony-ability.git#e199743a59ceb8c155856f233ca2d1762cfe5733"
+source = "git+https://github.com/harmony-contrib/openharmony-ability.git#595f63b33faa6e68149670ef200cde9b79b80f91"
 dependencies = [
  "proc-macro2",
  "quote",

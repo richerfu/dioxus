@@ -2,6 +2,7 @@ use crate::{BuildTargets, BundleFormat, Cli, Commands, Workspace};
 use anyhow::Result;
 use clap::Parser;
 use futures_util::{stream::FuturesUnordered, StreamExt};
+use krates::cm::TargetKind;
 use std::{
     collections::HashSet,
     fmt::Write,
@@ -46,6 +47,15 @@ async fn test_harnesses() {
                 "dx build",
                 |targets| async move { assert!(targets.is_err()) },
             ),
+        TestHarnessBuilder::new("harness-mobile-cdylib")
+            .deps(r#"dioxus = { workspace = true, features = ["mobile"] }"#)
+            .lib_cdylib()
+            .asrt(r#"dx build --ohos"#, |targets| async move {
+                let t = targets.unwrap();
+                assert_eq!(t.client.bundle, BundleFormat::Ohos);
+                assert_eq!(t.client.executable_type(), TargetKind::CDyLib);
+                assert_eq!(t.client.executable_name(), "harness_mobile_cdylib");
+            }),
         TestHarnessBuilder::new("harness-simple-fullstack")
             .deps(r#"dioxus = { workspace = true, features = ["fullstack"] }"#)
             .fetr(r#"web=["dioxus/web"]"#)
@@ -113,6 +123,11 @@ async fn test_harnesses() {
                 let t = targets.unwrap();
                 assert_eq!(t.client.bundle, BundleFormat::Android);
                 assert_eq!(t.client.triple, "aarch64-linux-android".parse().unwrap());
+            })
+            .asrt(r#"dx build --ohos"#, |targets| async move {
+                let t = targets.unwrap();
+                assert_eq!(t.client.bundle, BundleFormat::Ohos);
+                assert_eq!(t.client.triple, TestHarnessBuilder::host_ohos_triple());
             }),
         TestHarnessBuilder::new("harness-fullstack-multi-target-no-default")
             .deps(r#"dioxus = { workspace = true, features = ["fullstack"] }"#)
@@ -285,6 +300,7 @@ struct TestHarnessBuilder {
     name: String,
     dependencies: String,
     features: String,
+    lib_cdylib: bool,
     futures: Vec<TestHarnessTestCase>,
 }
 
@@ -300,6 +316,7 @@ impl TestHarnessBuilder {
             name: name.into(),
             dependencies: Default::default(),
             features: Default::default(),
+            lib_cdylib: false,
             futures: Default::default(),
         }
     }
@@ -313,6 +330,11 @@ impl TestHarnessBuilder {
     /// Add a feature to the test harness.
     fn fetr(mut self, features: impl Into<String>) -> Self {
         writeln!(&mut self.features, "{}", features.into()).unwrap();
+        self
+    }
+
+    fn lib_cdylib(mut self) -> Self {
+        self.lib_cdylib = true;
         self
     }
 
@@ -337,12 +359,19 @@ impl TestHarnessBuilder {
         let name = self.name.clone();
         let dependencies = self.dependencies.clone();
         let features = self.features.clone();
+        let lib_cdylib = self.lib_cdylib;
 
         let test_dir = harness_dir.join(&name);
 
         _ = std::fs::remove_dir_all(&test_dir);
         std::fs::create_dir_all(&test_dir).unwrap();
         std::fs::create_dir_all(test_dir.join("src")).unwrap();
+
+        let lib_section = if lib_cdylib {
+            "\n[lib]\ncrate-type = [\"cdylib\"]\n"
+        } else {
+            ""
+        };
 
         let cargo_toml = format!(
             r#"[package]
@@ -351,6 +380,7 @@ version = "0.0.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 publish = false
+{lib_section}
 
 [dependencies]
 {dependencies}
@@ -359,13 +389,21 @@ publish = false
 {features}
     "#,
             name = name,
+            lib_section = lib_section,
             dependencies = dependencies,
             features = features
         );
 
         std::fs::write(test_dir.join("Cargo.toml"), cargo_toml).unwrap();
 
-        let contents = if features.contains("dioxus") {
+        let contents = if lib_cdylib {
+            r#"use dioxus::prelude::*;
+
+pub fn dioxus_mobile_entry() {
+    let _ = rsx! { "hello world!" };
+}
+"#
+        } else if features.contains("dioxus") {
             r#"use dioxus::prelude::*;
 fn main() {
     dioxus::launch(|| rsx! { "hello world!" })
@@ -378,7 +416,13 @@ fn main() {
 "#
         };
 
-        std::fs::write(test_dir.join("src/main.rs"), contents).unwrap();
+        let source = if lib_cdylib {
+            test_dir.join("src/lib.rs")
+        } else {
+            test_dir.join("src/main.rs")
+        };
+
+        std::fs::write(source, contents).unwrap();
     }
 
     async fn run(harnesses: Vec<Self>) {
@@ -460,6 +504,16 @@ fn main() {
             "aarch64-apple-ios-sim".parse().unwrap()
         } else {
             "x86_64-apple-ios".parse().unwrap()
+        }
+    }
+
+    fn host_ohos_triple() -> Triple {
+        if cfg!(target_arch = "aarch64") {
+            "aarch64-unknown-linux-ohos".parse().unwrap()
+        } else if cfg!(target_arch = "arm") {
+            "armv7-unknown-linux-ohos".parse().unwrap()
+        } else {
+            "x86_64-unknown-linux-ohos".parse().unwrap()
         }
     }
 }

@@ -80,12 +80,13 @@ impl Bundle {
                 }
             }
 
-            // Web/ios can just use their root_dir
+            // Web/mobile platforms can just use their root_dir for now
             BundleFormat::Web => bundles.push(client.root_dir()),
             BundleFormat::Ios => {
                 tracing::warn!("iOS bundles are not currently codesigned! You will need to codesign the app before distributing.");
                 bundles.push(client.root_dir())
             }
+            BundleFormat::Ohos => bundles.push(client.root_dir()),
             BundleFormat::Server => bundles.push(client.root_dir()),
 
             BundleFormat::Android => {

@@ -1,7 +1,7 @@
 use crate::styles::GLOW_STYLE;
 use crate::CliSettings;
 use crate::Result;
-use crate::{config::DioxusConfig, AndroidTools};
+use crate::{config::DioxusConfig, AndroidTools, OhosTools};
 use anyhow::{bail, Context};
 use ignore::gitignore::Gitignore;
 use krates::{semver::Version, KrateDetails, LockOptions};
@@ -21,6 +21,7 @@ pub struct Workspace {
     pub(crate) ignore: Gitignore,
     pub(crate) cargo_toml: cargo_toml::Manifest,
     pub(crate) android_tools: Option<Arc<AndroidTools>>,
+    pub(crate) ohos_tools: Option<Arc<OhosTools>>,
 }
 
 impl Workspace {
@@ -102,6 +103,7 @@ impl Workspace {
         .context("Failed to load Cargo.toml")?;
 
         let android_tools = crate::build::get_android_tools();
+        let ohos_tools = crate::build::get_ohos_tools();
 
         let workspace = Arc::new(Self {
             krates,
@@ -112,6 +114,7 @@ impl Workspace {
             ignore,
             cargo_toml,
             android_tools,
+            ohos_tools,
         });
 
         tracing::debug!(
@@ -141,6 +144,12 @@ impl Workspace {
             .android_tools
             .clone()
             .context("Android not installed properly. Please set the `ANDROID_NDK_HOME` environment variable to the root of your NDK installation.")
+    }
+
+    pub fn ohos_tools(&self) -> Result<Arc<OhosTools>> {
+        self.ohos_tools.clone().context(
+            "OpenHarmony tooling not installed properly. Please set `OHOS_SDK_NATIVE`, `OHOS_NDK_HOME`, or `DEVECO_SDK_HOME`.",
+        )
     }
 
     pub fn is_release_profile(&self, profile: &str) -> bool {

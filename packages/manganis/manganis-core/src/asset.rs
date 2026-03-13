@@ -208,9 +208,11 @@ impl Asset {
         #[cfg(not(feature = "dioxus"))]
         let bundle_root = PathBuf::from("/assets/");
 
+        let bundled = self.bundled();
+
         // Otherwise presumably we're bundled and we can use the bundled path
         bundle_root.join(PathBuf::from(
-            self.bundled().bundled_path.as_str().trim_start_matches('/'),
+            bundled.bundled_path.as_str().trim_start_matches('/'),
         ))
     }
 }

@@ -322,8 +322,8 @@
 use super::HotpatchModuleCache;
 use crate::{
     AndroidTools, AppManifest, BuildContext, BuildId, BundleFormat, DioxusConfig, Error,
-    LinkAction, LinkerFlavor, ObjectCache, Platform, Renderer, Result, RustcArgs, TargetArgs,
-    TraceSrc, WasmBindgen, WasmOptConfig, Workspace, DX_RUSTC_WRAPPER_ENV_VAR,
+    LinkAction, LinkerFlavor, ObjectCache, OhosTools, Platform, Renderer, Result, RustcArgs,
+    TargetArgs, TraceSrc, WasmBindgen, WasmOptConfig, Workspace, DX_RUSTC_WRAPPER_ENV_VAR,
 };
 use anyhow::{bail, Context};
 use cargo_metadata::diagnostic::Diagnostic;
@@ -355,6 +355,18 @@ use target_lexicon::{Architecture, OperatingSystem, Triple};
 use tempfile::TempDir;
 use tokio::{io::AsyncBufReadExt, process::Command};
 use uuid::Uuid;
+
+fn ohos_lib_dir(triple: &Triple) -> &'static str {
+    match triple.architecture {
+        Architecture::Aarch64(_) => "arm64-v8a",
+        Architecture::Arm(_) => "armeabi-v7a",
+        Architecture::X86_64 => "x86_64",
+        _ => panic!(
+            "Unsupported architecture for OpenHarmony: {:?}",
+            triple.architecture
+        ),
+    }
+}
 
 /// This struct is used to plan the build process.
 ///
@@ -502,9 +514,15 @@ impl BuildRequest {
     pub(crate) async fn new(args: &TargetArgs, workspace: Arc<Workspace>) -> Result<Self> {
         let crate_package = workspace.find_main_package(args.package.clone())?;
 
-        let target_kind = match args.example.is_some() {
-            true => TargetKind::Example,
-            false => TargetKind::Bin,
+        let target_kinds = if args.example.is_some() {
+            vec![TargetKind::Example]
+        } else if matches!(
+            args.platform,
+            Platform::Ios | Platform::Android | Platform::Ohos
+        ) {
+            vec![TargetKind::CDyLib, TargetKind::Bin]
+        } else {
+            vec![TargetKind::Bin]
         };
 
         let main_package = &workspace.krates[crate_package];
@@ -521,7 +539,7 @@ impl BuildRequest {
                 let bin_count = main_package
                     .targets
                     .iter()
-                    .filter(|x| x.kind.contains(&target_kind))
+                    .filter(|x| target_kinds.iter().any(|kind| x.kind.contains(kind)))
                     .count();
 
                 if bin_count != 1 {
@@ -529,7 +547,7 @@ impl BuildRequest {
                 }
 
                 main_package.targets.iter().find_map(|x| {
-                    if x.kind.contains(&target_kind) {
+                    if target_kinds.iter().any(|kind| x.kind.contains(kind)) {
                         Some(x.name.clone())
                     } else {
                         None
@@ -542,11 +560,12 @@ impl BuildRequest {
         // specific build. This is important for @client @server syntax so we use the client's output directory for the bundle.
         let main_target = args.client_target.clone().unwrap_or(target_name.clone());
 
-        let crate_target = main_package
-            .targets
+        let crate_target = target_kinds
             .iter()
-            .find(|target| {
-                target_name == target.name.as_str() && target.kind.contains(&target_kind)
+            .find_map(|kind| {
+                main_package.targets.iter().find(|target| {
+                    target_name == target.name.as_str() && target.kind.contains(kind)
+                })
             })
             .with_context(|| {
                 let target_of_kind = |kind|-> String {
@@ -564,9 +583,21 @@ impl BuildRequest {
                     let binaries = target_of_kind(&TargetKind::Bin);
                     format!("Failed to find binary {bin}. \nAvailable binaries are:\n{binaries}")
                 } else {
-                    format!("Failed to find target {target_name}. \nIt looks like you are trying to build dioxus in a library crate. \
-                    You either need to run dx from inside a binary crate or build a specific example with the `--example` flag. \
-                    Available examples are:\n{}", target_of_kind(&TargetKind::Example))
+                    let library_targets = target_of_kind(&TargetKind::CDyLib);
+                    if matches!(
+                        args.platform,
+                        Platform::Ios | Platform::Android | Platform::Ohos
+                    ) {
+                        format!(
+                            "Failed to find target {target_name}. \nAvailable binaries are:\n{}\nAvailable mobile libraries are:\n{}",
+                            target_of_kind(&TargetKind::Bin),
+                            library_targets
+                        )
+                    } else {
+                        format!("Failed to find target {target_name}. \nIt looks like you are trying to build dioxus in a library crate. \
+                        You either need to run dx from inside a binary crate or build a specific example with the `--example` flag. \
+                        Available examples are:\n{}", target_of_kind(&TargetKind::Example))
+                    }
                 }
             })?
             .clone();
@@ -697,7 +728,7 @@ impl BuildRequest {
                 match direct {
                     _ if feature == "mobile" || feature == "dioxus/mobile" => {
                         bail!(
-                            "Could not autodetect mobile platform. Use --ios or --android instead."
+                            "Could not autodetect mobile platform. Use --ios, --android, or --ohos instead."
                         );
                     }
                     Renderer::Webview | Renderer::Native => {
@@ -801,6 +832,21 @@ impl BuildRequest {
                         }
                     }));
                 }
+            }
+            Platform::Ohos => {
+                if main_package.features.contains_key("mobile") && renderer.is_none() {
+                    features.push("mobile".into());
+                }
+
+                renderer = renderer.or(Some(Renderer::Webview));
+                bundle_format = bundle_format.or(Some(BundleFormat::Ohos));
+                triple = triple.or(Some(match Triple::host().architecture {
+                    Architecture::X86_32(_) => "x86_64-unknown-linux-ohos".parse()?,
+                    Architecture::X86_64 => "x86_64-unknown-linux-ohos".parse()?,
+                    Architecture::Arm(_) => "armv7-unknown-linux-ohos".parse()?,
+                    Architecture::Aarch64(_) => "aarch64-unknown-linux-ohos".parse()?,
+                    _ => "aarch64-unknown-linux-ohos".parse()?,
+                }));
             }
             Platform::Server => {
                 if main_package.features.contains_key("server") && renderer.is_none() {
@@ -962,6 +1008,10 @@ impl BuildRequest {
             );
         }
 
+        if custom_linker.is_none() && bundle == BundleFormat::Ohos {
+            custom_linker = Some(workspace.ohos_tools()?.ohos_cc(&triple));
+        }
+
         let target_dir = std::env::var("CARGO_TARGET_DIR")
             .ok()
             .map(PathBuf::from)
@@ -973,12 +1023,16 @@ impl BuildRequest {
             if let Some(profile_data) = workspace.cargo_toml.profile.custom.get(&profile) {
                 use cargo_toml::{DebugSetting, LtoSetting};
                 if matches!(profile_data.lto, Some(LtoSetting::None) | None) {
-                    tracing::warn!("wasm-split requires LTO to be enabled in the profile. \
-                        Please set `lto = true` in the `[profile.{profile}]` section of your Cargo.toml");
+                    tracing::warn!(
+                        "wasm-split requires LTO to be enabled in the profile. \
+                        Please set `lto = true` in the `[profile.{profile}]` section of your Cargo.toml"
+                    );
                 }
                 if matches!(profile_data.debug, Some(DebugSetting::None) | None) {
-                    tracing::warn!("wasm-split requires debug symbols to be enabled in the profile. \
-                        Please set `debug = true` in the `[profile.{profile}]` section of your Cargo.toml");
+                    tracing::warn!(
+                        "wasm-split requires debug symbols to be enabled in the profile. \
+                        Please set `debug = true` in the `[profile.{profile}]` section of your Cargo.toml"
+                    );
                 }
             }
         }
@@ -1069,8 +1123,10 @@ impl BuildRequest {
         .await;
 
         // We want to copy over the prebuilt OpenSSL binaries to ~/.dx/prebuilt/openssl-<version>
-        if self.bundle == BundleFormat::Android {
-            AndroidTools::unpack_prebuilt_openssl()?;
+        match self.bundle {
+            BundleFormat::Android => AndroidTools::unpack_prebuilt_openssl()?,
+            BundleFormat::Ohos => OhosTools::unpack_prebuilt_openssl()?,
+            _ => {}
         }
 
         Ok(())
@@ -1307,7 +1363,18 @@ impl BuildRequest {
                 Message::CompilerArtifact(artifact) => {
                     units_compiled += 1;
                     ctx.status_build_progress(units_compiled, crate_count, artifact.target.name);
-                    output_location = artifact.executable.map(Into::into);
+                    let artifact_output = artifact.executable.map(Into::into).or_else(|| {
+                        let expected = self.platform_exe_name();
+                        artifact.filenames.iter().find_map(|path| {
+                            path.file_name()
+                                .filter(|name| *name == expected.as_str())
+                                .map(|_| path.clone().into_std_path_buf())
+                        })
+                    });
+
+                    if artifact_output.is_some() {
+                        output_location = artifact_output;
+                    }
                 }
                 // todo: this can occasionally swallow errors, so we should figure out what exactly is going wrong
                 //       since that is a really bad user experience.
@@ -1364,8 +1431,11 @@ impl BuildRequest {
 
         // Collect the linker args and attach them to the tip crate's bin entry
         let tip_crate_name = self.tip_crate_name();
-        let tip_bin_key = format!("{tip_crate_name}.bin");
-        if let Some(tip_args) = workspace_rustc_args.get_mut(&tip_bin_key) {
+        let tip_target_key = match self.executable_type() {
+            TargetKind::Lib | TargetKind::CDyLib => format!("{tip_crate_name}.lib"),
+            _ => format!("{tip_crate_name}.bin"),
+        };
+        if let Some(tip_args) = workspace_rustc_args.get_mut(&tip_target_key) {
             tip_args.link_args = std::fs::read_to_string(self.link_args_file())
                 .context("Failed to read link args from file")?
                 .lines()
@@ -1373,7 +1443,29 @@ impl BuildRequest {
                 .collect();
         }
 
-        let exe = output_location.context("Cargo build failed - no output location. Toggle tracing mode (press `t`) for more information.")?;
+        let exe = output_location
+            .or_else(|| {
+                if matches!(self.executable_type(), TargetKind::Lib | TargetKind::CDyLib) {
+                    let profile_dir = self
+                        .target_dir
+                        .join(self.triple.to_string())
+                        .join(&self.profile);
+                    let direct = profile_dir.join(self.platform_exe_name());
+                    if direct.exists() {
+                        return Some(direct);
+                    }
+
+                    let in_deps = profile_dir.join("deps").join(self.platform_exe_name());
+                    if in_deps.exists() {
+                        return Some(in_deps);
+                    }
+                }
+
+                None
+            })
+            .context(
+                "Cargo build failed - no output location. Toggle tracing mode (press `t`) for more information.",
+            )?;
 
         // Fat builds need to be linked with the fat linker. Would also like to link here for thin builds
         if matches!(ctx.mode, BuildMode::Fat) {
@@ -1382,7 +1474,7 @@ impl BuildRequest {
             self.run_fat_link(
                 &exe,
                 &workspace_rustc_args
-                    .get(&tip_bin_key)
+                    .get(&tip_target_key)
                     .cloned()
                     .unwrap_or_default(),
             )
@@ -2084,6 +2176,7 @@ impl BuildRequest {
             | BundleFormat::Windows
             | BundleFormat::Linux
             | BundleFormat::Ios
+            | BundleFormat::Ohos
             | BundleFormat::Server => {
                 std::fs::create_dir_all(self.exe_dir())?;
                 std::fs::copy(exe, self.main_exe())?;
@@ -2101,17 +2194,24 @@ impl BuildRequest {
         let framework_dir = self.frameworks_folder();
 
         // We use the rustc for the tip crate `main.rs` because that's where the linking happens
+        let tip_rustc_key = match self.executable_type() {
+            TargetKind::Lib | TargetKind::CDyLib => format!("{}.lib", self.tip_crate_name()),
+            _ => format!("{}.bin", self.tip_crate_name()),
+        };
         let direct_rustc = artifacts
             .workspace_rustc_args
-            .get(&format!("{}.bin", self.tip_crate_name()))
+            .get(&tip_rustc_key)
             .cloned()
             .unwrap_or_default();
+        let link_args = direct_rustc.link_args.clone();
 
         // We have some prebuilt stuff that needs to be copied into the framework dir
-        let openssl_dir = AndroidTools::openssl_lib_dir(&self.triple);
-        let openssl_dir_disp = openssl_dir.display().to_string();
-
-        for arg in &direct_rustc.link_args {
+        let openssl_dir = self.bundle_openssl_lib_dir();
+        let openssl_dir_disp = openssl_dir
+            .as_ref()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_default();
+        for arg in &link_args {
             // todo - how do we handle windows dlls? we don't want to bundle the system dlls
             // for now, we don't do anything with dlls, and only use .dylibs and .so files
 
@@ -2119,6 +2219,14 @@ impl BuildRequest {
             if arg.ends_with(".dylib") | arg.ends_with(".so") {
                 let from = PathBuf::from(arg);
                 let to = framework_dir.join(from.file_name().unwrap());
+
+                // The main bundle artifact is written separately by `write_executable`.
+                // On mobile bundles the frameworks folder can be the same directory as the main
+                // executable, so copying or symlinking it here would overwrite the patched output.
+                if to == self.main_exe() {
+                    continue;
+                }
+
                 _ = std::fs::remove_file(&to);
 
                 tracing::debug!("Copying framework from {from:?} to {to:?}");
@@ -2142,8 +2250,8 @@ impl BuildRequest {
                 }
             }
 
-            // Always create the framework dir for android
-            if self.bundle == BundleFormat::Android {
+            // Always create the framework dir for mobile shared libraries.
+            if matches!(self.bundle, BundleFormat::Android | BundleFormat::Ohos) {
                 _ = std::fs::create_dir_all(&framework_dir);
             }
 
@@ -2156,9 +2264,18 @@ impl BuildRequest {
                 )
                 .with_context(|| "Failed to copy libc++_shared.so into bundle")?;
             }
+        }
 
-            // Copy over libssl and libcrypto if they are present in the link args
-            if self.bundle == BundleFormat::Android && arg.contains(openssl_dir_disp.as_str()) {
+        let needs_mobile_openssl =
+            matches!(self.bundle, BundleFormat::Android | BundleFormat::Ohos)
+                && !openssl_dir_disp.is_empty()
+                && (link_args
+                    .iter()
+                    .any(|arg| arg.contains(openssl_dir_disp.as_str()))
+                    || Self::binary_needs_mobile_openssl(&artifacts.exe));
+
+        if needs_mobile_openssl {
+            if let Some(openssl_dir) = openssl_dir.as_ref() {
                 let libssl_source = openssl_dir.join("libssl.so");
                 let libcrypto_source = openssl_dir.join("libcrypto.so");
                 let libssl_target = framework_dir.join("libssl.so");
@@ -2200,6 +2317,10 @@ impl BuildRequest {
                     .join("jniLibs")
                     .join(arch)
             }
+            OperatingSystem::Linux if self.bundle == BundleFormat::Ohos => self
+                .ohos_entry_dir()
+                .join("libs")
+                .join(ohos_lib_dir(&self.triple)),
             OperatingSystem::Linux | OperatingSystem::Windows => self.root_dir(),
             _ => self.root_dir(),
         }
@@ -2215,6 +2336,39 @@ impl BuildRequest {
             OperatingSystem::IOS(_) => self.root_dir().join("PlugIns"),
             _ => self.root_dir().join("PlugIns"),
         }
+    }
+
+    fn verify_tooling_ohos(&self) -> Result<()> {
+        let linker = self.workspace.ohos_tools()?.ohos_cc(&self.triple);
+        if !linker.exists() {
+            anyhow::bail!(
+                "OpenHarmony linker not found at {}. Please set `OHOS_SDK_NATIVE`, `OHOS_NDK_HOME`, or `DEVECO_SDK_HOME`.",
+                linker.display()
+            );
+        }
+        Ok(())
+    }
+
+    fn bundle_openssl_lib_dir(&self) -> Option<PathBuf> {
+        match self.bundle {
+            BundleFormat::Android => Some(AndroidTools::openssl_lib_dir(&self.triple)),
+            BundleFormat::Ohos => Some(OhosTools::openssl_lib_dir(&self.triple)),
+            _ => None,
+        }
+    }
+
+    fn binary_needs_mobile_openssl(binary: &Path) -> bool {
+        std::fs::read(binary)
+            .ok()
+            .map(|contents| {
+                contents
+                    .windows(b"libssl.so".len())
+                    .any(|window| window == b"libssl.so")
+                    || contents
+                        .windows(b"libcrypto.so".len())
+                        .any(|window| window == b"libcrypto.so")
+            })
+            .unwrap_or(false)
     }
 
     /// Copy the assets out of the manifest and into the target location
@@ -3420,12 +3574,19 @@ impl BuildRequest {
 
         // Set the executable
         match self.executable_type() {
-            TargetKind::Bin => cargo_args.push("--bin".to_string()),
-            TargetKind::Lib => cargo_args.push("--lib".to_string()),
-            TargetKind::Example => cargo_args.push("--example".to_string()),
+            TargetKind::Bin => {
+                cargo_args.push("--bin".to_string());
+                cargo_args.push(self.executable_name().to_string());
+            }
+            TargetKind::Lib | TargetKind::CDyLib => {
+                cargo_args.push("--lib".to_string());
+            }
+            TargetKind::Example => {
+                cargo_args.push("--example".to_string());
+                cargo_args.push(self.executable_name().to_string());
+            }
             _ => {}
         };
-        cargo_args.push(self.executable_name().to_string());
 
         // Set offline/locked/frozen
         let lock_opts = crate::verbosity_or_default();
@@ -3605,6 +3766,10 @@ impl BuildRequest {
             env_vars.extend(self.android_env_vars()?);
         };
 
+        if self.bundle == BundleFormat::Ohos {
+            env_vars.extend(self.ohos_env_vars()?);
+        };
+
         // If this is a release build, bake the base path and title into the binary with env vars.
         // todo: should we even be doing this? might be better being a build.rs or something else.
         if self.release {
@@ -3655,6 +3820,25 @@ impl BuildRequest {
                 link_args_file: dunce::canonicalize(self.link_args_file())?,
             }
             .write_env_vars(&mut env_vars)?;
+
+            if self.bundle == BundleFormat::Ohos {
+                let cargo_target_linker_key = format!(
+                    "CARGO_TARGET_{}_LINKER",
+                    self.triple
+                        .to_string()
+                        .replace('-', "_")
+                        .to_ascii_uppercase()
+                );
+                let dx_linker = Workspace::path_to_dx()?.into_os_string();
+                if let Some((_, value)) = env_vars
+                    .iter_mut()
+                    .find(|(key, _)| key.as_ref() == cargo_target_linker_key)
+                {
+                    *value = dx_linker.clone();
+                } else {
+                    env_vars.push((cargo_target_linker_key.into(), dx_linker));
+                }
+            }
         }
 
         Ok(env_vars)
@@ -3956,6 +4140,125 @@ impl BuildRequest {
         Ok(dir)
     }
 
+    fn ohos_env_vars(&self) -> Result<Vec<(Cow<'static, str>, OsString)>> {
+        fn cc_env(var_base: &str, triple: &str) -> (String, Option<String>) {
+            #[inline]
+            fn env_var_with_key(key: String) -> Option<(String, String)> {
+                std::env::var(&key).map(|value| (key, value)).ok()
+            }
+
+            let triple_u = triple.replace('-', "_");
+            let most_specific_key = format!("{}_{}", var_base, triple);
+
+            env_var_with_key(most_specific_key.to_string())
+                .or_else(|| env_var_with_key(format!("{}_{}", var_base, triple_u)))
+                .or_else(|| env_var_with_key(format!("TARGET_{}", var_base)))
+                .or_else(|| env_var_with_key(var_base.to_string()))
+                .map(|(key, value)| (key, Some(value)))
+                .unwrap_or_else(|| (most_specific_key, None))
+        }
+
+        fn cargo_env_target_cfg(triple: &str, key: &str) -> String {
+            format!("CARGO_TARGET_{}_{}", &triple.replace('-', "_"), key).to_uppercase()
+        }
+
+        let mut env_vars: Vec<(Cow<'static, str>, OsString)> = vec![];
+        let tools = self.workspace.ohos_tools()?;
+        let linker = tools.ohos_cc(&self.triple);
+        let target_cc = tools.ohos_cc(&self.triple);
+        let target_cxx = tools.ohos_cxx(&self.triple);
+        let target_ar = tools.ar_path();
+        let target_ranlib = tools.ranlib();
+        let sdk_root = tools.sdk_root.clone();
+        let sdk_native = tools.native_root.clone();
+        let sysroot = tools.sysroot();
+        let triple = self.triple.to_string();
+
+        tracing::debug!(
+            r#"Using OpenHarmony:
+            linker: {linker:?}
+            target_cc: {target_cc:?}
+            target_cxx: {target_cxx:?}
+            target_ar: {target_ar:?}
+            target_ranlib: {target_ranlib:?}
+            sdk_root: {sdk_root:?}
+            sdk_native: {sdk_native:?}
+            sysroot: {sysroot:?}
+            "#
+        );
+
+        let (cc_key, _cc_value) = cc_env("CC", &triple);
+        let (cflags_key, cflags_value) = cc_env("CFLAGS", &triple);
+        let (cxx_key, _cxx_value) = cc_env("CXX", &triple);
+        let (cxxflags_key, cxxflags_value) = cc_env("CXXFLAGS", &triple);
+        let (ar_key, _ar_value) = cc_env("AR", &triple);
+        let (ranlib_key, _ranlib_value) = cc_env("RANLIB", &triple);
+
+        let bindgen_clang_args_key =
+            format!("BINDGEN_EXTRA_CLANG_ARGS_{}", &triple.replace('-', "_"));
+        let cargo_ar_key = cargo_env_target_cfg(&triple, "ar");
+        let cargo_linker_key = cargo_env_target_cfg(&triple, "linker");
+        let sysroot_target = crate::OhosTools::sysroot_target(&self.triple);
+        let bindgen_args = format!(
+            "--sysroot={} -I{} -I{}",
+            sysroot.display(),
+            sysroot
+                .join("usr")
+                .join("include")
+                .join(sysroot_target)
+                .display(),
+            sysroot.join("usr").join("include").display(),
+        );
+
+        let target_u = triple.replace('-', "_").to_ascii_uppercase();
+        let openssl_dir = std::env::var_os(format!("{target_u}_OPENSSL_DIR"))
+            .or_else(|| std::env::var_os("OPENSSL_DIR"))
+            .map(PathBuf::from);
+        let openssl_lib_dir = std::env::var_os(format!("{target_u}_OPENSSL_LIB_DIR"))
+            .or_else(|| std::env::var_os("OPENSSL_LIB_DIR"))
+            .map(PathBuf::from)
+            .or_else(|| openssl_dir.as_ref().map(|dir| dir.join("lib")))
+            .unwrap_or_else(|| OhosTools::openssl_lib_dir(&self.triple));
+        let openssl_include_dir = std::env::var_os(format!("{target_u}_OPENSSL_INCLUDE_DIR"))
+            .or_else(|| std::env::var_os("OPENSSL_INCLUDE_DIR"))
+            .map(PathBuf::from)
+            .or_else(|| openssl_dir.as_ref().map(|dir| dir.join("include")))
+            .unwrap_or_else(OhosTools::openssl_include_dir);
+        let openssl_libs = std::env::var_os(format!("{target_u}_OPENSSL_LIBS"))
+            .or_else(|| std::env::var_os("OPENSSL_LIBS"))
+            .unwrap_or_else(|| OsString::from("ssl:crypto"));
+
+        env_vars.extend([
+            (cc_key.into(), target_cc.clone().into_os_string()),
+            (cflags_key.into(), cflags_value.unwrap_or_default().into()),
+            (cxx_key.into(), target_cxx.clone().into_os_string()),
+            (
+                cxxflags_key.into(),
+                cxxflags_value.unwrap_or_default().into(),
+            ),
+            (ar_key.into(), target_ar.clone().into_os_string()),
+            (ranlib_key.into(), target_ranlib.clone().into_os_string()),
+            (cargo_ar_key.into(), target_ar.into_os_string()),
+            (cargo_linker_key.into(), linker.clone().into_os_string()),
+            ("OHOS_NDK_HOME".into(), sdk_root.clone().into_os_string()),
+            ("OHOS_SDK_NATIVE".into(), sdk_native.into_os_string()),
+            ("CLANG_PATH".into(), target_cc.into_os_string()),
+            (bindgen_clang_args_key.into(), bindgen_args.into()),
+        ]);
+
+        if let Some(openssl_dir) = openssl_dir {
+            env_vars.push(("OPENSSL_DIR".into(), openssl_dir.into_os_string()));
+        }
+        env_vars.push(("OPENSSL_LIB_DIR".into(), openssl_lib_dir.into_os_string()));
+        env_vars.push((
+            "OPENSSL_INCLUDE_DIR".into(),
+            openssl_include_dir.into_os_string(),
+        ));
+        env_vars.push(("OPENSSL_LIBS".into(), openssl_libs));
+
+        Ok(env_vars)
+    }
+
     /// Get an estimate of the number of units in the crate. If nightly rustc is not available, this
     /// will return an estimate of the number of units in the crate based on cargo metadata.
     ///
@@ -4059,6 +4362,7 @@ impl BuildRequest {
             // These might not actually need to be called `.app` but it does let us run these with `open`
             BundleFormat::MacOS => platform_dir.join(format!("{}.app", self.bundled_app_name())),
             BundleFormat::Ios => platform_dir.join(format!("{}.app", self.bundled_app_name())),
+            BundleFormat::Ohos => platform_dir,
 
             // in theory, these all could end up directly in the root dir
             BundleFormat::Android => platform_dir.join("app"), // .apk (after bundling)
@@ -4081,6 +4385,10 @@ impl BuildRequest {
             .join(self.bundle.build_folder_name())
     }
 
+    fn ohos_entry_dir(&self) -> PathBuf {
+        self.root_dir().join("entry")
+    }
+
     fn platform_exe_name(&self) -> String {
         match self.bundle {
             // mac/ios are unixy and dont have an exe extension
@@ -4095,6 +4403,7 @@ impl BuildRequest {
             // from the apk spec, the root exe is a shared library
             // we include the user's rust code as a shared library with a fixed namespace
             BundleFormat::Android => "libdioxusmain.so".to_string(),
+            BundleFormat::Ohos => format!("lib{}.so", self.executable_name().replace('-', "_")),
 
             // this will be wrong, I think, but not important?
             BundleFormat::Web => format!("{}_bg.wasm", self.executable_name()),
@@ -4403,6 +4712,251 @@ impl BuildRequest {
             ),
         )?;
 
+        Ok(())
+    }
+
+    fn build_ohos_app_dir(&self) -> Result<()> {
+        use std::fs::{create_dir_all, write};
+
+        #[derive(Serialize)]
+        struct OhosHandlebarsObjects {
+            app_name: String,
+            bundle_name: String,
+            description: String,
+            library_name: String,
+            module_name: String,
+            project_name: String,
+            version: String,
+            version_code: u64,
+        }
+
+        let root = self.root_dir();
+        let hvigor_dir = root.join("hvigor");
+        let app_scope = root.join("AppScope");
+        let app_scope_resources = app_scope.join("resources").join("base");
+        let app_scope_element = app_scope_resources.join("element");
+        let app_scope_media = app_scope_resources.join("media");
+
+        let entry = self.ohos_entry_dir();
+        let entry_cpp = entry.join("src").join("main").join("cpp");
+        let entry_types = entry_cpp.join("types").join(self.platform_exe_name());
+        let entry_ets = entry.join("src").join("main").join("ets");
+        let entry_resources = entry
+            .join("src")
+            .join("main")
+            .join("resources")
+            .join("base");
+        let entry_element = entry_resources.join("element");
+        let entry_media = entry_resources.join("media");
+        let entry_profile = entry_resources.join("profile");
+
+        create_dir_all(&app_scope_element)?;
+        create_dir_all(&app_scope_media)?;
+        create_dir_all(&hvigor_dir)?;
+        create_dir_all(&entry)?;
+        create_dir_all(entry.join("libs"))?;
+        create_dir_all(&entry_cpp)?;
+        create_dir_all(&entry_types)?;
+        create_dir_all(entry_ets.join("entryability"))?;
+        create_dir_all(entry_ets.join("entrybackupability"))?;
+        create_dir_all(entry_ets.join("pages"))?;
+        create_dir_all(&entry_element)?;
+        create_dir_all(&entry_media)?;
+        create_dir_all(&entry_profile)?;
+
+        let description = self
+            .package()
+            .description
+            .clone()
+            .unwrap_or_else(|| "Please describe the basic information.".to_string());
+        let hbs_data = OhosHandlebarsObjects {
+            app_name: self.bundled_app_name(),
+            bundle_name: self.bundle_identifier(),
+            description,
+            library_name: self.platform_exe_name(),
+            module_name: self.ohos_module_name(),
+            project_name: self.package().name.replace('-', "_"),
+            version: self.crate_version(),
+            version_code: self.ohos_version_code(),
+        };
+        let hbs = handlebars::Handlebars::new();
+
+        write(
+            root.join("build-profile.json5"),
+            hbs.render_template(
+                include_str!("../../assets/ohos/gen/build-profile.json5.hbs"),
+                &hbs_data,
+            )?,
+        )?;
+        write(
+            root.join("code-linter.json5"),
+            include_bytes!("../../assets/ohos/gen/code-linter.json5"),
+        )?;
+        write(
+            root.join("hvigorfile.ts"),
+            include_bytes!("../../assets/ohos/gen/hvigorfile.ts"),
+        )?;
+        write(
+            root.join("hvigor").join("hvigor-config.json5"),
+            include_bytes!("../../assets/ohos/gen/hvigor/hvigor-config.json5"),
+        )?;
+        write(
+            root.join("oh-package.json5"),
+            hbs.render_template(
+                include_str!("../../assets/ohos/gen/oh-package.json5.hbs"),
+                &hbs_data,
+            )?,
+        )?;
+
+        write(
+            app_scope.join("app.json5"),
+            hbs.render_template(
+                include_str!("../../assets/ohos/gen/AppScope/app.json5.hbs"),
+                &hbs_data,
+            )?,
+        )?;
+        write(
+            app_scope_element.join("string.json"),
+            hbs.render_template(
+                include_str!(
+                    "../../assets/ohos/gen/AppScope/resources/base/element/string.json.hbs"
+                ),
+                &hbs_data,
+            )?,
+        )?;
+        write(
+            app_scope_media.join("layered_image.json"),
+            include_bytes!(
+                "../../assets/ohos/gen/AppScope/resources/base/media/layered_image.json"
+            ),
+        )?;
+        Self::write_ohos_placeholder_png(&app_scope_media.join("background.png"))?;
+        Self::write_ohos_placeholder_png(&app_scope_media.join("foreground.png"))?;
+
+        write(
+            entry.join("build-profile.json5"),
+            include_bytes!("../../assets/ohos/gen/entry/build-profile.json5"),
+        )?;
+        write(
+            entry.join("hvigorfile.ts"),
+            include_bytes!("../../assets/ohos/gen/entry/hvigorfile.ts"),
+        )?;
+        write(
+            entry.join("oh-package.json5"),
+            hbs.render_template(
+                include_str!("../../assets/ohos/gen/entry/oh-package.json5.hbs"),
+                &hbs_data,
+            )?,
+        )?;
+        write(
+            entry.join("src").join("main").join("module.json5"),
+            hbs.render_template(
+                include_str!("../../assets/ohos/gen/entry/src/main/module.json5.hbs"),
+                &hbs_data,
+            )?,
+        )?;
+        write(
+            entry_cpp.join("CMakeLists.txt"),
+            hbs.render_template(
+                include_str!("../../assets/ohos/gen/entry/src/main/cpp/CMakeLists.txt.hbs"),
+                &hbs_data,
+            )?,
+        )?;
+        write(
+            entry_cpp.join("napi_init.cpp"),
+            include_bytes!("../../assets/ohos/gen/entry/src/main/cpp/napi_init.cpp"),
+        )?;
+        write(
+            entry_types.join("Index.d.ts"),
+            include_bytes!("../../assets/ohos/gen/entry/src/main/cpp/types/libentry/Index.d.ts"),
+        )?;
+        write(
+            entry_types.join("oh-package.json5"),
+            hbs.render_template(
+                include_str!(
+                    "../../assets/ohos/gen/entry/src/main/cpp/types/libentry/oh-package.json5.hbs"
+                ),
+                &hbs_data,
+            )?,
+        )?;
+        write(
+            entry_ets.join("entryability").join("EntryAbility.ets"),
+            hbs.render_template(
+                include_str!(
+                    "../../assets/ohos/gen/entry/src/main/ets/entryability/EntryAbility.ets.hbs"
+                ),
+                &hbs_data,
+            )?,
+        )?;
+        write(
+            entry_ets
+                .join("entrybackupability")
+                .join("EntryBackupAbility.ets"),
+            include_bytes!(
+                "../../assets/ohos/gen/entry/src/main/ets/entrybackupability/EntryBackupAbility.ets"
+            ),
+        )?;
+        write(
+            entry_ets.join("pages").join("Index.ets"),
+            include_bytes!("../../assets/ohos/gen/entry/src/main/ets/pages/Index.ets"),
+        )?;
+
+        write(
+            entry_element.join("color.json"),
+            include_bytes!(
+                "../../assets/ohos/gen/entry/src/main/resources/base/element/color.json"
+            ),
+        )?;
+        write(
+            entry_element.join("float.json"),
+            include_bytes!(
+                "../../assets/ohos/gen/entry/src/main/resources/base/element/float.json"
+            ),
+        )?;
+        write(
+            entry_element.join("string.json"),
+            hbs.render_template(
+                include_str!(
+                    "../../assets/ohos/gen/entry/src/main/resources/base/element/string.json.hbs"
+                ),
+                &hbs_data,
+            )?,
+        )?;
+        write(
+            entry_profile.join("backup_config.json"),
+            include_bytes!(
+                "../../assets/ohos/gen/entry/src/main/resources/base/profile/backup_config.json"
+            ),
+        )?;
+        write(
+            entry_profile.join("main_pages.json"),
+            include_bytes!(
+                "../../assets/ohos/gen/entry/src/main/resources/base/profile/main_pages.json"
+            ),
+        )?;
+        write(
+            entry_media.join("layered_image.json"),
+            include_bytes!(
+                "../../assets/ohos/gen/entry/src/main/resources/base/media/layered_image.json"
+            ),
+        )?;
+        Self::write_ohos_placeholder_png(&entry_media.join("background.png"))?;
+        Self::write_ohos_placeholder_png(&entry_media.join("foreground.png"))?;
+        Self::write_ohos_placeholder_png(&entry_media.join("startIcon.png"))?;
+
+        Ok(())
+    }
+
+    fn write_ohos_placeholder_png(path: &Path) -> Result<()> {
+        const PLACEHOLDER_PNG: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0xf0, 0x1f, 0x00, 0x05, 0x00, 0x01, 0xff, 0x89, 0x99,
+            0x3d, 0x1d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+
+        std::fs::write(path, PLACEHOLDER_PNG)?;
         Ok(())
     }
 
@@ -4773,6 +5327,15 @@ impl BuildRequest {
         self.executable_name().to_case(Case::Pascal)
     }
 
+    fn ohos_module_name(&self) -> String {
+        self.executable_name().replace('-', "_")
+    }
+
+    fn ohos_version_code(&self) -> u64 {
+        let version = &self.package().version;
+        version.major * 1_000_000 + version.minor * 1_000 + version.patch
+    }
+
     /// Get the crate version from Cargo.toml (e.g., "0.1.0")
     fn crate_version(&self) -> String {
         self.workspace.krates[self.crate_package]
@@ -4899,6 +5462,7 @@ impl BuildRequest {
             // AndroidManifest.xml
             // er.... maybe even all the kotlin/java/gradle stuff?
             BundleFormat::Android => {}
+            BundleFormat::Ohos => {}
 
             // Probably some custom format or a plist file (haha)
             // When we do the proper bundle, we'll need to do something with wix templates, I think?
@@ -4940,6 +5504,7 @@ impl BuildRequest {
             | BundleFormat::Linux
             | BundleFormat::Ios
             | BundleFormat::Android
+            | BundleFormat::Ohos
             | BundleFormat::Server => {}
         }
 
@@ -5097,10 +5662,12 @@ impl BuildRequest {
                 let path = bindgen_outdir.join(format!("chunk_{}_{}.wasm", idx, chunk.module_name));
                 wasm_opt::write_wasm(&chunk.bytes, &path, &wasm_opt_options).await?;
                 writeln!(
-                    glue, "export const __wasm_split_load_chunk_{idx} = makeLoad(\"/{base_path}/assets/{url}\", [], fusedImports);",
+                    glue,
+                    "export const __wasm_split_load_chunk_{idx} = makeLoad(\"/{base_path}/assets/{url}\", [], fusedImports);",
                     base_path = self.base_path_or_default(),
                     url = assets
-                        .register_asset(&path, AssetOptions::builder().into_asset_options())?.bundled_path(),
+                        .register_asset(&path, AssetOptions::builder().into_asset_options())?
+                        .bundled_path(),
                 )?;
             }
 
@@ -5124,14 +5691,11 @@ impl BuildRequest {
                     glue,
                     "export const __wasm_split_load_{module}_{hash_id}_{comp_name} = makeLoad(\"/{base_path}/assets/{url}\", [{deps}], fusedImports);",
                     module = module.module_name,
-
                     base_path = self.base_path_or_default(),
-
                     // Again, register this wasm with the asset system
                     url = assets
                         .register_asset(&path, AssetOptions::builder().into_asset_options())?
                         .bundled_path(),
-
                     // This time, make sure to write the dependencies of this chunk
                     // The names here are again, hardcoded in wasm-split - fix this eventually.
                     deps = module
@@ -5569,6 +6133,8 @@ __wbg_init({{module_or_path: "/{}/{wasm_path}"}}).then((wasm) => {{
             // by writing them here.
             if self.bundle == BundleFormat::Android {
                 self.build_android_app_dir()?;
+            } else if self.bundle == BundleFormat::Ohos {
+                self.build_ohos_app_dir()?;
             }
 
             Ok(())
@@ -5594,6 +6160,14 @@ __wbg_init({{module_or_path: "/{}/{wasm_path}"}}).then((wasm) => {{
                 .join("app")
                 .join("src")
                 .join("main")
+                .join("assets"),
+
+            BundleFormat::Ohos => self
+                .ohos_entry_dir()
+                .join("src")
+                .join("main")
+                .join("resources")
+                .join("rawfile")
                 .join("assets"),
 
             // We put assets in public/assets for server apps
@@ -5629,6 +6203,10 @@ __wbg_init({{module_or_path: "/{}/{wasm_path}"}}).then((wasm) => {{
                 .join("main")
                 .join("jniLibs")
                 .join(AndroidTools::android_jnilib(&self.triple)),
+            BundleFormat::Ohos => self
+                .ohos_entry_dir()
+                .join("libs")
+                .join(ohos_lib_dir(&self.triple)),
 
             // these are all the same, I think?
             BundleFormat::Windows
@@ -5687,6 +6265,7 @@ __wbg_init({{module_or_path: "/{}/{wasm_path}"}}).then((wasm) => {{
             BundleFormat::Web => self.verify_web_tooling().await?,
             BundleFormat::Ios => self.verify_ios_tooling().await?,
             BundleFormat::Android => self.verify_android_tooling().await?,
+            BundleFormat::Ohos => self.verify_tooling_ohos()?,
             BundleFormat::Linux => self.verify_linux_tooling().await?,
             BundleFormat::MacOS | BundleFormat::Windows | BundleFormat::Server => {}
         }
@@ -6413,7 +6992,9 @@ __wbg_init({{module_or_path: "/{}/{wasm_path}"}}).then((wasm) => {{
                             .await
                             .unwrap();
                     } else {
-                        tracing::warn!("No Android emulators found. Please create one using `emulator -avd <name>`");
+                        tracing::warn!(
+                            "No Android emulators found. Please create one using `emulator -avd <name>`"
+                        );
                     }
                 });
             }

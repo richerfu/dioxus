@@ -63,6 +63,7 @@ pub(crate) struct DioxusConfig {
 pub enum BundlePlatform {
     Ios,
     Android,
+    Ohos,
     MacOS,
     Windows,
     Linux,
@@ -74,6 +75,7 @@ impl From<crate::BundleFormat> for BundlePlatform {
         match format {
             crate::BundleFormat::Ios => BundlePlatform::Ios,
             crate::BundleFormat::Android => BundlePlatform::Android,
+            crate::BundleFormat::Ohos => BundlePlatform::Ohos,
             crate::BundleFormat::MacOS => BundlePlatform::MacOS,
             crate::BundleFormat::Windows => BundlePlatform::Windows,
             crate::BundleFormat::Linux => BundlePlatform::Linux,
@@ -89,6 +91,7 @@ impl DioxusConfig {
         let platform_override = match platform {
             BundlePlatform::Ios => self.ios.identifier.as_deref(),
             BundlePlatform::Android => self.android.identifier.as_deref(),
+            BundlePlatform::Ohos => None,
             BundlePlatform::MacOS => self.macos.identifier.as_deref(),
             BundlePlatform::Windows => self.windows.identifier.as_deref(),
             BundlePlatform::Linux => self.linux.identifier.as_deref(),

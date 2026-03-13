@@ -32,6 +32,15 @@ pub(crate) fn resolve_native_asset_path(path: &str) -> Result<PathBuf, AssetPath
             }
         }
 
+        #[cfg(target_env = "ohos")]
+        {
+            // If the asset exists in the OpenHarmony resource manager, return the can't be represented as a path
+            // error instead
+            if to_ohos_load_asset(path).is_some() {
+                return AssetPathError::CannotRepresentAsPath;
+            }
+        }
+
         AssetPathError::NotFound
     })
 }
@@ -91,6 +100,13 @@ pub(crate) fn resolve_native_asset(path: &str) -> Result<Vec<u8>, NativeAssetRes
         }
     }
 
+    #[cfg(target_env = "ohos")]
+    {
+        if let Some(asset) = to_ohos_load_asset(path) {
+            return Ok(asset);
+        }
+    }
+
     let Some(uri_path) = resolve_asset_path_from_filesystem(path) else {
         return Err(NativeAssetResolveError::IoError(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -112,6 +128,15 @@ fn resolve_asset(path: &str) -> Result<Option<ResolvedAsset>, NativeAssetResolve
         }
     }
 
+    #[cfg(target_env = "ohos")]
+    {
+        if let Some(asset) = to_ohos_load_asset(path) {
+            let extension = path.rsplit_once('.').map(|(_, ext)| ext);
+            let mime_type = get_mime_from_ext(extension);
+            return Ok(Some(ResolvedAsset::new(mime_type, asset)));
+        }
+    }
+
     let Some(uri_path) = resolve_asset_path_from_filesystem(path) else {
         return Ok(None);
     };
@@ -128,6 +153,7 @@ fn resolve_asset(path: &str) -> Result<Option<ResolvedAsset>, NativeAssetResolve
 /// Platform specifics:
 /// - On the web, this returns AssetServerError since there's no filesystem access. Use `fetch` instead.
 /// - On Android, it attempts to load assets using the Android AssetManager.
+/// - On OpenHarmony, it attempts to load assets using the OpenHarmony ResourceManager.
 /// - On other platforms, it serves assets from the filesystem.
 pub fn serve_asset(path: &str) -> Result<Response<Vec<u8>>, AssetServeError> {
     match resolve_asset(path)? {
@@ -230,6 +256,31 @@ pub fn get_mime_from_ext(ext: Option<&str>) -> &'static str {
         // using octet stream according to this:
         None => "application/octet-stream",
     }
+}
+
+#[cfg(target_env = "ohos")]
+fn to_ohos_load_asset(filepath: &str) -> Option<Vec<u8>> {
+    let normalized = percent_encoding::percent_decode_str(filepath)
+        .decode_utf8()
+        .ok()?
+        .replace('\\', "/");
+    let normalized = normalized.trim();
+    let normalized = normalized
+        .trim_start_matches("/assets/")
+        .trim_start_matches('/');
+    if normalized.is_empty() || normalized.ends_with('/') {
+        return None;
+    }
+
+    let resource_manager = openharmony_ability::OpenHarmonyApp::current_resource_manager()?;
+    let raw_dir = resource_manager.open_dir("", true).ok()?;
+    let raw_path = [normalized.to_string(), format!("assets/{normalized}")]
+        .into_iter()
+        .find(|candidate| raw_dir.files.contains_key(candidate))?;
+
+    let raw_file = raw_dir.open_file64(raw_path);
+    let file_size = raw_file.file_size();
+    (file_size >= 0).then(|| raw_file.read(file_size))
 }
 
 #[cfg(target_os = "android")]

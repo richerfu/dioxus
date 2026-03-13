@@ -244,7 +244,10 @@ impl WebviewInstance {
             ));
         }
 
-        let window = Arc::new(window.build(&shared.target).unwrap());
+        let window = Arc::new(window.build(&shared.target).unwrap_or_else(|err| {
+            let err_msg = format!("failed to build window: {err:?}");
+            panic!("{err_msg}");
+        }));
         if let Some(on_build) = cfg.on_window.as_mut() {
             on_build(window.clone(), &mut dom);
         }
@@ -497,7 +500,10 @@ impl WebviewInstance {
             let vbox = window.default_vbox().unwrap();
             webview.build_gtk(vbox)
         };
-        let webview = webview.unwrap();
+        let webview = webview.unwrap_or_else(|err| {
+            let err_msg = format!("failed to build webview: {err:?}");
+            panic!("{err_msg}");
+        });
 
         let desktop_context = Rc::from(DesktopService::new(
             webview,

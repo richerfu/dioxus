@@ -667,6 +667,9 @@ impl AppBuilder {
                 self.open_android(false, devserver_ip, envs, self.build.device_name.clone())
                     .await?;
             }
+            BundleFormat::Ohos => {
+                bail!("`dx serve --ohos` is not implemented yet");
+            }
 
             // These are all just basically running the main exe, but with slightly different resource dir paths
             BundleFormat::Server
@@ -1531,9 +1534,11 @@ impl AppBuilder {
         // The requirement here is based on the platform, not necessarily our current architecture.
         let requires_entropy = match self.build.bundle {
             // When running "bundled", we don't need entropy
-            BundleFormat::Web | BundleFormat::MacOS | BundleFormat::Ios | BundleFormat::Android => {
-                false
-            }
+            BundleFormat::Web
+            | BundleFormat::MacOS
+            | BundleFormat::Ios
+            | BundleFormat::Android
+            | BundleFormat::Ohos => false,
 
             // But on platforms that aren't running as "bundled", we do.
             BundleFormat::Windows | BundleFormat::Linux | BundleFormat::Server => true,
@@ -1759,6 +1764,10 @@ impl AppBuilder {
                 .lines()
                 .map(|line| line.trim())
                 .join("")
+            }
+            BundleFormat::Ohos => {
+                tracing::warn!("Debugger attachment for OpenHarmony is not implemented yet");
+                return Ok(());
             }
         };
 

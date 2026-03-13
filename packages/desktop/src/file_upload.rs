@@ -41,33 +41,53 @@ pub(crate) struct FileDialogRequest {
 
 #[allow(unused)]
 impl FileDialogRequest {
-    #[cfg(not(all(
-        any(
-            target_os = "windows",
-            target_os = "macos",
-            target_os = "linux",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "netbsd",
-            target_os = "openbsd"
-        ),
-        not(target_env = "ohos")
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "macos",
+        all(target_os = "linux", not(target_env = "ohos")),
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
     )))]
     pub(crate) fn get_file_event(&self) -> Vec<PathBuf> {
         vec![]
     }
 
-    #[cfg(all(
-        any(
-            target_os = "windows",
-            target_os = "macos",
-            target_os = "linux",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "netbsd",
-            target_os = "openbsd"
-        ),
-        not(target_env = "ohos")
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "macos",
+        all(target_os = "linux", not(target_env = "ohos")),
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )))]
+    pub(crate) fn get_file_event_sync(&self) -> Vec<PathBuf> {
+        vec![]
+    }
+
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "macos",
+        all(target_os = "linux", not(target_env = "ohos")),
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )))]
+    pub(crate) async fn get_file_event_async(&self) -> Vec<PathBuf> {
+        vec![]
+    }
+
+    #[cfg(any(
+        target_os = "windows",
+        target_os = "macos",
+        all(target_os = "linux", not(target_env = "ohos")),
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
     ))]
     pub(crate) fn get_file_event_sync(&self) -> Vec<PathBuf> {
         let dialog = rfd::FileDialog::new();
@@ -81,7 +101,7 @@ impl FileDialogRequest {
     #[cfg(any(
         target_os = "windows",
         target_os = "macos",
-        target_os = "linux",
+        all(target_os = "linux", not(target_env = "ohos")),
         target_os = "dragonfly",
         target_os = "freebsd",
         target_os = "netbsd",
@@ -153,7 +173,7 @@ impl FileDialogRequest {
     #[cfg(any(
         target_os = "windows",
         target_os = "macos",
-        target_os = "linux",
+        all(target_os = "linux", not(target_env = "ohos")),
         target_os = "dragonfly",
         target_os = "freebsd",
         target_os = "netbsd",
@@ -193,7 +213,7 @@ impl FileDialogRequest {
     #[cfg(any(
         target_os = "windows",
         target_os = "macos",
-        target_os = "linux",
+        all(target_os = "linux", not(target_env = "ohos")),
         target_os = "dragonfly",
         target_os = "freebsd",
         target_os = "netbsd",

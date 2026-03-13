@@ -34,6 +34,10 @@ pub(crate) enum Platform {
     #[serde(rename = "android")]
     Android,
 
+    /// Alias for `--target <ohos-triple> --renderer webview --bundle-format ohos`
+    #[serde(rename = "ohos")]
+    Ohos,
+
     /// Alias for `--target <host> --renderer ssr --bundle-format server`
     #[serde(rename = "server")]
     Server,
@@ -56,6 +60,7 @@ impl Platform {
             "linux" => Ok(Self::Linux),
             "ios" => Ok(Self::Ios),
             "android" => Ok(Self::Android),
+            "ohos" => Ok(Self::Ohos),
             "server" => Ok(Self::Server),
             "liveview" => Ok(Self::Liveview),
             "desktop" => {
@@ -94,23 +99,24 @@ impl Args for Platform {
             .arg(arg!(--linux "Target a linux desktop app").help_heading(HELP_HEADING))
             .arg(arg!(--ios "Target an ios app").help_heading(HELP_HEADING))
             .arg(arg!(--android "Target an android app").help_heading(HELP_HEADING))
+            .arg(arg!(--ohos "Target an OpenHarmony app").help_heading(HELP_HEADING))
             .arg(arg!(--server "Target a server build").help_heading(HELP_HEADING))
             .arg(arg!(--liveview "Target a liveview build").help_heading(HELP_HEADING))
             .arg(
                 Arg::new("platform")
                     .long("platform")
                     .value_name("PLATFORM")
-                    .help("Manually set the platform (web, macos, windows, linux, ios, android, server, liveview)")
+                    .help("Manually set the platform (web, macos, windows, linux, ios, android, ohos, server, liveview)")
                     .help_heading(HELP_HEADING)
                     .value_parser([
-                        "web", "macos", "windows", "linux", "ios", "android", "server", "liveview", "desktop",
+                        "web", "macos", "windows", "linux", "ios", "android", "ohos", "server", "liveview", "desktop",
                     ])
                     .conflicts_with("target_alias"),
             )
             .group(
                 clap::ArgGroup::new("target_alias")
                     .args([
-                        "web", "desktop", "macos", "windows", "linux", "ios", "android", "server",
+                        "web", "desktop", "macos", "windows", "linux", "ios", "android", "ohos", "server",
                         "liveview",
                     ])
                     .multiple(false)
@@ -175,7 +181,9 @@ impl Renderer {
     pub(crate) fn feature_name(&self, target: &Triple) -> &str {
         match self {
             Renderer::Webview => match (target.environment, target.operating_system) {
-                (Environment::Android, _) | (_, OperatingSystem::IOS(_)) => "mobile",
+                (Environment::Android, _)
+                | (Environment::Ohos, _)
+                | (_, OperatingSystem::IOS(_)) => "mobile",
                 _ => "desktop",
             },
             Renderer::Native => "native",
@@ -272,6 +280,10 @@ pub(crate) enum BundleFormat {
     /// Targeting the android bundle structure
     #[serde(rename = "android")]
     Android,
+
+    /// Targeting the OpenHarmony bundle structure
+    #[serde(rename = "ohos")]
+    Ohos,
 }
 
 impl BundleFormat {
@@ -297,6 +309,7 @@ impl BundleFormat {
             Self::Server => "web",
             Self::Ios => "ios",
             Self::Android => "android",
+            Self::Ohos => "ohos",
             Self::Windows => "windows",
             Self::Linux => "linux",
             Self::MacOS => "macos",
@@ -309,6 +322,7 @@ impl BundleFormat {
             Self::Web => "wasm",
             Self::Ios => "ios",
             Self::Android => "android",
+            Self::Ohos => "ohos",
             Self::Server => "server",
         };
 
@@ -325,6 +339,7 @@ impl BundleFormat {
             Self::Linux => "Linux",
             Self::Ios => "iOS",
             Self::Android => "Android",
+            Self::Ohos => "OpenHarmony",
             Self::Server => "Server",
         }
     }
@@ -353,6 +368,7 @@ impl FromStr for BundleFormat {
             "server" => Ok(Self::Server),
             "ios" => Ok(Self::Ios),
             "android" => Ok(Self::Android),
+            "ohos" => Ok(Self::Ohos),
             _ => Err(UnknownBundleFormatError),
         }
     }
@@ -368,6 +384,7 @@ impl Display for BundleFormat {
             BundleFormat::Server => "server",
             BundleFormat::Ios => "ios",
             BundleFormat::Android => "android",
+            BundleFormat::Ohos => "ohos",
         })
     }
 }

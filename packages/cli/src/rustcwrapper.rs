@@ -117,9 +117,9 @@ pub fn run_rustc() -> ExitCode {
             // {crate_name}.bin.json. This avoids the ambiguity of a bare {crate_name}.json
             // and ensures lib+bin crates don't overwrite each other.
             let suffix = match crate_type {
-                Some("lib" | "rlib") => "lib",
+                Some("lib" | "rlib" | "dylib" | "cdylib") => "lib",
                 Some("bin") => "bin",
-                _ => "bin", // proc-macro, cdylib, etc. — treat as bin
+                _ => "bin", // proc-macro, build-script, etc. — treat as bin
             };
 
             std::fs::write(

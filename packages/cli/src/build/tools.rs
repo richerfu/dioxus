@@ -18,6 +18,12 @@ pub(crate) struct AndroidTools {
     pub(crate) java_home: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct OhosTools {
+    pub(crate) sdk_root: PathBuf,
+    pub(crate) native_root: PathBuf,
+}
+
 pub fn get_android_tools() -> Option<Arc<AndroidTools>> {
     // We check for SDK first since users might install Android Studio and then install the SDK
     // After that they might install the NDK, so the SDK drives the source of truth.
@@ -117,6 +123,24 @@ pub fn get_android_tools() -> Option<Arc<AndroidTools>> {
         adb,
         java_home,
         sdk,
+    }))
+}
+
+pub fn get_ohos_tools() -> Option<Arc<OhosTools>> {
+    let native_root = var_or_debug("OHOS_SDK_NATIVE")
+        .or_else(|| {
+            var_or_debug("OHOS_NDK_HOME")
+                .or_else(|| var_or_debug("OHOS_SDK_HOME"))
+                .or_else(|| var_or_debug("DEVECO_SDK_HOME"))
+                .and_then(|path| resolve_ohos_native_root(&path))
+        })
+        .or_else(autodetect_ohos_native_root)?;
+
+    let sdk_root = native_root.parent()?.to_path_buf();
+
+    Some(Arc::new(OhosTools {
+        sdk_root,
+        native_root,
     }))
 }
 
@@ -347,6 +371,163 @@ impl AndroidTools {
 
         Ok(())
     }
+}
+
+impl OhosTools {
+    const OPENSSL_PREBUILT_NAME: &str = "openssl-3.4.0-dev-ohos-1";
+
+    pub(crate) fn openssl_prebuilt_archive() -> &'static [u8] {
+        include_bytes!("../../assets/ohos/prebuilt/openssl-3.4.0-dev-ohos-1.tar.gz")
+    }
+
+    pub(crate) fn openssl_prebuilt_dest() -> PathBuf {
+        crate::Workspace::dioxus_data_dir()
+            .join("prebuilt")
+            .join(Self::OPENSSL_PREBUILT_NAME)
+    }
+
+    pub(crate) fn openssl_lib_dir(arch: &Triple) -> PathBuf {
+        let libs_dir = Self::openssl_prebuilt_dest().join("ssl").join("libs");
+
+        match arch.architecture {
+            Architecture::Arm(_) => libs_dir.join("ohos.armeabi-v7a"),
+            Architecture::Aarch64(_) => libs_dir.join("ohos.arm64-v8a"),
+            Architecture::X86_64 => libs_dir.join("ohos.x86_64"),
+            _ => libs_dir.join("ohos.arm64-v8a"),
+        }
+    }
+
+    pub(crate) fn openssl_include_dir() -> PathBuf {
+        Self::openssl_prebuilt_dest().join("ssl").join("include")
+    }
+
+    pub(crate) fn unpack_prebuilt_openssl() -> Result<()> {
+        let archive_bytes = Self::openssl_prebuilt_archive();
+        let archive_dest = Self::openssl_prebuilt_dest();
+
+        if archive_dest.exists() {
+            tracing::trace!("Prebuilt OpenSSL already exists at {:?}", archive_dest);
+            return Ok(());
+        }
+
+        std::fs::create_dir_all(archive_dest.parent().context("no parent for archive")?)
+            .context("failed to create prebuilt OpenSSL directory")?;
+
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(archive_bytes as &[u8]));
+        archive
+            .unpack(
+                archive_dest
+                    .parent()
+                    .context("no parent for archive dest")?,
+            )
+            .context("failed to unpack prebuilt OpenSSL archive")?;
+
+        tracing::debug!("Unpacked prebuilt OpenSSL to {:?}", archive_dest);
+
+        Ok(())
+    }
+
+    pub(crate) fn llvm_bin(&self) -> PathBuf {
+        self.native_root.join("llvm").join("bin")
+    }
+
+    pub(crate) fn sysroot(&self) -> PathBuf {
+        self.native_root.join("sysroot")
+    }
+
+    pub(crate) fn ohos_cc(&self, triple: &Triple) -> PathBuf {
+        self.llvm_bin()
+            .join(format!("{}-clang", triple.to_string()))
+    }
+
+    pub(crate) fn ohos_cxx(&self, triple: &Triple) -> PathBuf {
+        self.llvm_bin()
+            .join(format!("{}-clang++", triple.to_string()))
+    }
+
+    pub(crate) fn ar_path(&self) -> PathBuf {
+        self.llvm_bin().join("llvm-ar")
+    }
+
+    pub(crate) fn ranlib(&self) -> PathBuf {
+        self.llvm_bin().join("llvm-ranlib")
+    }
+
+    pub(crate) fn sysroot_target(triple: &Triple) -> &'static str {
+        match triple.architecture {
+            Architecture::Arm(_) => "arm-linux-ohos",
+            Architecture::Aarch64(_) => "aarch64-linux-ohos",
+            Architecture::X86_64 => "x86_64-linux-ohos",
+            Architecture::X86_32(_) => "i686-linux-ohos",
+            _ => "aarch64-linux-ohos",
+        }
+    }
+}
+
+fn resolve_ohos_native_root(path: &PathBuf) -> Option<PathBuf> {
+    if path.join("llvm").join("bin").exists() {
+        return Some(path.clone());
+    }
+
+    if path.join("native").join("llvm").join("bin").exists() {
+        return Some(path.join("native"));
+    }
+
+    let default_sdk_root = path.join("default").join("openharmony");
+    if default_sdk_root
+        .join("native")
+        .join("llvm")
+        .join("bin")
+        .exists()
+    {
+        return Some(default_sdk_root.join("native"));
+    }
+
+    None
+}
+
+fn autodetect_ohos_native_root() -> Option<PathBuf> {
+    let mut candidates = vec![PathBuf::from(
+        "/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/native",
+    )];
+
+    if let Ok(applications) = std::fs::read_dir("/Applications") {
+        for entry in applications.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+
+            if name.starts_with("DevEco") && name.ends_with(".app") {
+                candidates.push(
+                    path.join("Contents")
+                        .join("sdk")
+                        .join("default")
+                        .join("openharmony")
+                        .join("native"),
+                );
+            }
+        }
+    }
+
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        let meat_sdk = home.join(".meat").join("sdk");
+        if let Ok(entries) = std::fs::read_dir(&meat_sdk) {
+            for entry in entries.flatten() {
+                candidates.push(
+                    entry
+                        .path()
+                        .join("default")
+                        .join("openharmony")
+                        .join("native"),
+                );
+            }
+        }
+    }
+
+    candidates
+        .into_iter()
+        .find(|path| path.join("llvm").join("bin").exists())
 }
 
 fn var_or_debug(name: &str) -> Option<PathBuf> {
