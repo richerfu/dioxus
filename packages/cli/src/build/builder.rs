@@ -668,7 +668,7 @@ impl AppBuilder {
                     .await?;
             }
             BundleFormat::Ohos => {
-                bail!("`dx serve --ohos` is not implemented yet");
+                self.open_ohos(devserver_ip, envs).await?;
             }
 
             // These are all just basically running the main exe, but with slightly different resource dir paths
@@ -1505,6 +1505,114 @@ impl AppBuilder {
 
         self.spawn_handle = Some(task);
         self.adb_logcat_stdout = Some(UnboundedReceiverStream::new(stdout_rx));
+
+        Ok(())
+    }
+
+    async fn open_ohos(
+        &mut self,
+        devserver_socket: SocketAddr,
+        envs: Vec<(String, String)>,
+    ) -> Result<()> {
+        let hap_path = self.build.ohos_hap_path();
+        let session_cache = self.build.session_cache_dir();
+        let application_id = self.build.bundle_identifier();
+        let hdc = self.build.workspace.ohos_tools()?.hdc()?;
+
+        let task = tokio::task::spawn(async move {
+            let port = devserver_socket.port();
+
+            if let Err(err) = Command::new(&hdc)
+                .arg("rport")
+                .arg(format!("tcp:{port}"))
+                .arg(format!("tcp:{port}"))
+                .output()
+                .await
+            {
+                tracing::error!("Failed to reverse-forward OpenHarmony port {port}: {err}");
+            }
+
+            let remote_cache = dioxus_cli_config::ohos_session_cache_dir();
+            _ = std::fs::create_dir_all(&session_cache);
+            let env_file = session_cache.join(".env");
+            _ = std::fs::write(
+                &env_file,
+                envs.iter()
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+
+            let mkdir = Command::new(&hdc)
+                .arg("shell")
+                .arg("mkdir")
+                .arg("-p")
+                .arg(&remote_cache)
+                .output()
+                .await
+                .context("Failed to create OpenHarmony session cache directory")?;
+            if !mkdir.status.success() {
+                bail!(
+                    "Failed to create OpenHarmony session cache directory: {}{}",
+                    String::from_utf8_lossy(&mkdir.stdout),
+                    String::from_utf8_lossy(&mkdir.stderr)
+                );
+            }
+
+            let push = Command::new(&hdc)
+                .arg("file")
+                .arg("send")
+                .arg(&env_file)
+                .arg(remote_cache.join(".env"))
+                .output()
+                .await
+                .context("Failed to push OpenHarmony env file")?;
+            if !push.status.success() {
+                bail!(
+                    "Failed to push OpenHarmony env file: {}{}",
+                    String::from_utf8_lossy(&push.stdout),
+                    String::from_utf8_lossy(&push.stderr)
+                );
+            }
+
+            let install = Command::new(&hdc)
+                .arg("install")
+                .arg("-r")
+                .arg(&hap_path)
+                .output()
+                .await
+                .context("Failed to install OpenHarmony hap")?;
+            if !install.status.success() {
+                bail!(
+                    "Failed to install OpenHarmony hap: {}{}",
+                    String::from_utf8_lossy(&install.stdout),
+                    String::from_utf8_lossy(&install.stderr)
+                );
+            }
+
+            let launch = Command::new(&hdc)
+                .arg("shell")
+                .arg("aa")
+                .arg("start")
+                .arg("-a")
+                .arg("EntryAbility")
+                .arg("-b")
+                .arg(&application_id)
+                .output()
+                .await
+                .context("Failed to start OpenHarmony ability")?;
+            if !launch.status.success() {
+                bail!(
+                    "Failed to start OpenHarmony ability: {}{}",
+                    String::from_utf8_lossy(&launch.stdout),
+                    String::from_utf8_lossy(&launch.stderr)
+                );
+            }
+
+            Ok::<(), Error>(())
+        });
+
+        self.spawn_handle = Some(task);
 
         Ok(())
     }

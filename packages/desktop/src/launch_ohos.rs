@@ -8,11 +8,35 @@ use dioxus_document::eval;
 use std::any::Any;
 use tao::event::{Event, StartCause, WindowEvent};
 
+fn load_debug_env_file() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+
+    let Some(session_dir) = dioxus_cli_config::session_cache_dir() else {
+        return;
+    };
+
+    let env_file = session_dir.join(".env");
+    let env_contents = match std::fs::read_to_string(env_file) {
+        std::result::Result::Ok(contents) => contents,
+        Err(_) => return,
+    };
+
+    for entry in env_contents.lines() {
+        if let Some((key, value)) = entry.trim().split_once('=') {
+            unsafe { std::env::set_var(key, value) };
+        }
+    }
+}
+
 /// Launch the WebView and run the event loop, with configuration and root props.
 ///
 /// This will block the main thread, and *must* be spawned on the main thread. This function does not assume any runtime
 /// and is equivalent to calling launch_with_props with the tokio feature disabled.
 pub fn launch_virtual_dom_blocking(virtual_dom: VirtualDom, mut desktop_config: Config) -> () {
+    load_debug_env_file();
+
     let mut custom_event_handler = desktop_config.custom_event_handler.take();
     let (event_loop, app) = App::new(desktop_config, virtual_dom);
     let app = Box::leak(Box::new(app));

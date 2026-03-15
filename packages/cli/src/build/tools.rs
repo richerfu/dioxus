@@ -431,6 +431,23 @@ impl OhosTools {
         self.native_root.join("llvm").join("bin")
     }
 
+    pub(crate) fn hdc(&self) -> Result<PathBuf> {
+        let bundled = self.sdk_root.join("toolchains").join("hdc");
+        if bundled.exists() {
+            return Ok(bundled);
+        }
+
+        which::which("hdc").context("Failed to find `hdc` in PATH")
+    }
+
+    pub(crate) fn hvigorw(&self) -> Result<PathBuf> {
+        which::which("hvigorw").context("Failed to find `hvigorw` in PATH")
+    }
+
+    pub(crate) fn ohpm(&self) -> Result<PathBuf> {
+        which::which("ohpm").context("Failed to find `ohpm` in PATH")
+    }
+
     pub(crate) fn sysroot(&self) -> PathBuf {
         self.native_root.join("sysroot")
     }
@@ -537,4 +554,28 @@ fn var_or_debug(name: &str) -> Option<PathBuf> {
         .inspect_err(|_| tracing::trace!("{name} not set"))
         .ok()
         .map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ohos_tools_prefers_bundled_hdc() {
+        let temp = tempfile::tempdir().unwrap();
+        let sdk_root = temp.path().join("sdk");
+        let native_root = sdk_root.join("native");
+        let bundled_hdc = sdk_root.join("toolchains").join("hdc");
+
+        std::fs::create_dir_all(bundled_hdc.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(native_root.join("llvm/bin")).unwrap();
+        std::fs::write(&bundled_hdc, b"").unwrap();
+
+        let tools = OhosTools {
+            sdk_root,
+            native_root,
+        };
+
+        assert_eq!(tools.hdc().unwrap(), bundled_hdc);
+    }
 }

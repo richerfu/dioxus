@@ -536,6 +536,21 @@ impl BuildRequest {
                     return Some(default_run.to_string());
                 }
 
+                if matches!(
+                    args.platform,
+                    Platform::Ios | Platform::Android | Platform::Ohos
+                ) {
+                    let mobile_libraries = main_package
+                        .targets
+                        .iter()
+                        .filter(|target| target.kind.contains(&TargetKind::CDyLib))
+                        .collect::<Vec<_>>();
+
+                    if mobile_libraries.len() == 1 {
+                        return Some(mobile_libraries[0].name.clone());
+                    }
+                }
+
                 let bin_count = main_package
                     .targets
                     .iter()
@@ -1443,29 +1458,38 @@ impl BuildRequest {
                 .collect();
         }
 
-        let exe = output_location
-            .or_else(|| {
-                if matches!(self.executable_type(), TargetKind::Lib | TargetKind::CDyLib) {
-                    let profile_dir = self
-                        .target_dir
-                        .join(self.triple.to_string())
-                        .join(&self.profile);
-                    let direct = profile_dir.join(self.platform_exe_name());
-                    if direct.exists() {
-                        return Some(direct);
-                    }
+        let prefer_raw_ohos_cdylib = self.bundle == BundleFormat::Ohos
+            && matches!(self.executable_type(), TargetKind::Lib | TargetKind::CDyLib)
+            && matches!(ctx.mode, BuildMode::Base { .. });
 
-                    let in_deps = profile_dir.join("deps").join(self.platform_exe_name());
-                    if in_deps.exists() {
-                        return Some(in_deps);
-                    }
+        let direct_output = || {
+            if matches!(self.executable_type(), TargetKind::Lib | TargetKind::CDyLib) {
+                let profile_dir = self
+                    .target_dir
+                    .join(self.triple.to_string())
+                    .join(&self.profile);
+                let direct = profile_dir.join(self.platform_exe_name());
+                if direct.exists() {
+                    return Some(direct);
                 }
 
-                None
-            })
-            .context(
-                "Cargo build failed - no output location. Toggle tracing mode (press `t`) for more information.",
-            )?;
+                let in_deps = profile_dir.join("deps").join(self.platform_exe_name());
+                if in_deps.exists() {
+                    return Some(in_deps);
+                }
+            }
+
+            None
+        };
+
+        let exe = if prefer_raw_ohos_cdylib {
+            direct_output().or(output_location)
+        } else {
+            output_location.or_else(direct_output)
+        }
+        .context(
+            "Cargo build failed - no output location. Toggle tracing mode (press `t`) for more information.",
+        )?;
 
         // Fat builds need to be linked with the fat linker. Would also like to link here for thin builds
         if matches!(ctx.mode, BuildMode::Fat) {
@@ -2339,13 +2363,23 @@ impl BuildRequest {
     }
 
     fn verify_tooling_ohos(&self) -> Result<()> {
-        let linker = self.workspace.ohos_tools()?.ohos_cc(&self.triple);
+        let tools = self.workspace.ohos_tools()?;
+        let linker = tools.ohos_cc(&self.triple);
         if !linker.exists() {
             anyhow::bail!(
                 "OpenHarmony linker not found at {}. Please set `OHOS_SDK_NATIVE`, `OHOS_NDK_HOME`, or `DEVECO_SDK_HOME`.",
                 linker.display()
             );
         }
+
+        let hdc = tools.hdc()?;
+        if !hdc.exists() {
+            anyhow::bail!("OpenHarmony `hdc` not found at {}.", hdc.display());
+        }
+
+        _ = tools.hvigorw()?;
+        _ = tools.ohpm()?;
+
         Ok(())
     }
 
@@ -3633,8 +3667,16 @@ impl BuildRequest {
         // dx links android, thin builds, and fat builds with a custom linker.
         // Note: We don't intercept Darwin Base builds since Swift plugins are compiled as dynamic
         // frameworks that load at runtime, not linked statically into the binary.
-        let use_dx_linker = self.custom_linker.is_some()
-            || matches!(build_mode, BuildMode::Thin { .. } | BuildMode::Fat);
+        //
+        // OpenHarmony Base builds should use the platform clang directly. Wrapping them through
+        // the dx linker currently produces a relinked `.so` that differs from Cargo's raw cdylib
+        // output and drops the NAPI registration glue needed by `openharmony-ability`.
+        let use_dx_linker = if self.bundle == BundleFormat::Ohos {
+            matches!(build_mode, BuildMode::Thin { .. } | BuildMode::Fat)
+        } else {
+            self.custom_linker.is_some()
+                || matches!(build_mode, BuildMode::Thin { .. } | BuildMode::Fat)
+        };
 
         if use_dx_linker {
             cargo_args.push(format!(
@@ -6009,6 +6051,51 @@ __wbg_init({{module_or_path: "/{}/{wasm_path}"}}).then((wasm) => {{
                     String::from_utf8_lossy(&output.stderr)
                 );
             }
+        } else if let BundleFormat::Ohos = self.bundle {
+            ctx.status_running_gradle();
+
+            let tools = self.workspace.ohos_tools()?;
+            let ohpm = tools.ohpm()?;
+            let hvigorw = tools.hvigorw()?;
+
+            if !self.root_dir().join("oh_modules").exists() {
+                let output = Command::new(&ohpm)
+                    .arg("install")
+                    .current_dir(self.root_dir())
+                    .output()
+                    .await
+                    .context("Failed to run ohpm install")?;
+
+                if !output.status.success() {
+                    bail!(
+                        "Failed to install OpenHarmony dependencies: {}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+
+            let build_mode = if self.release { "release" } else { "debug" };
+            let output = Command::new(&hvigorw)
+                .args([
+                    "assembleApp",
+                    "-p",
+                    "product=default",
+                    "-p",
+                    &format!("buildMode={build_mode}"),
+                ])
+                .current_dir(self.root_dir())
+                .output()
+                .await
+                .context("Failed to run hvigorw assembleApp")?;
+
+            if !output.status.success() {
+                bail!(
+                    "Failed to assemble OpenHarmony app: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
         }
 
         // if the triple is a ios or macos target, we need to codesign the binary
@@ -6086,6 +6173,24 @@ __wbg_init({{module_or_path: "/{}/{wasm_path}"}}).then((wasm) => {{
             .join("apk")
             .join("debug")
             .join("app-debug.apk")
+    }
+
+    pub(crate) fn ohos_hap_path(&self) -> PathBuf {
+        let output_dir = self
+            .ohos_entry_dir()
+            .join("build")
+            .join("default")
+            .join("outputs")
+            .join("default");
+
+        for candidate in ["entry-default-signed.hap", "entry-default-unsigned.hap"] {
+            let path = output_dir.join(candidate);
+            if path.exists() {
+                return path;
+            }
+        }
+
+        output_dir.join("entry-default-signed.hap")
     }
 
     /// We only really currently care about:

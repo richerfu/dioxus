@@ -305,11 +305,20 @@ pub fn session_cache_dir() -> Option<PathBuf> {
         return Some(android_session_cache_dir());
     }
 
+    if cfg!(target_env = "ohos") {
+        return Some(ohos_session_cache_dir());
+    }
+
     std::env::var(SESSION_CACHE_DIR).ok().map(PathBuf::from)
 }
 
 /// The session cache directory for android
 pub fn android_session_cache_dir() -> PathBuf {
+    PathBuf::from("/data/local/tmp/dx/")
+}
+
+/// The session cache directory for OpenHarmony
+pub fn ohos_session_cache_dir() -> PathBuf {
     PathBuf::from("/data/local/tmp/dx/")
 }
 
