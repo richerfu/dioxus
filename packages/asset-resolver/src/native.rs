@@ -272,6 +272,17 @@ fn to_ohos_load_asset(filepath: &str) -> Option<Vec<u8>> {
         return None;
     }
 
+    #[cfg(debug_assertions)]
+    {
+        let override_root = dioxus_cli_config::ohos_asset_override_dir();
+        let override_path = override_root.join(normalized);
+        if override_path.exists() {
+            if let Ok(bytes) = std::fs::read(override_path) {
+                return Some(bytes);
+            }
+        }
+    }
+
     let resource_manager = openharmony_ability::resource_manager()?;
     let raw_dir = resource_manager.open_dir("", true).ok()?;
     let raw_path = [normalized.to_string(), format!("assets/{normalized}")]

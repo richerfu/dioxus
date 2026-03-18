@@ -28,6 +28,8 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use super::{BuildContext, BuildId, BuildMode, HotpatchModuleCache};
 
+const OHOS_BFTPD_PORT: u16 = 9021;
+
 /// The component of the serve engine that watches ongoing builds and manages their state, open handle,
 /// and progress.
 ///
@@ -884,6 +886,9 @@ impl AppBuilder {
                     .copy_file_to_android_tmp(&changed_file, &bundled_name)
                     .await;
             }
+            if self.build.bundle == BundleFormat::Ohos {
+                _ = self.copy_file_to_ohos_tmp(&output_path, &bundled_name).await;
+            }
             bundled_names.push(bundled_name);
         }
 
@@ -916,6 +921,174 @@ impl AppBuilder {
         }
 
         Ok(target)
+    }
+
+    pub(crate) async fn copy_file_to_ohos_tmp(
+        &self,
+        changed_file: &Path,
+        bundled_name: &Path,
+    ) -> Result<PathBuf> {
+        let staged_target = dioxus_cli_config::ohos_session_cache_dir().join(bundled_name);
+        let hdc = self.build.workspace.ohos_tools()?.hdc()?;
+
+        if let Some(parent) = staged_target.parent() {
+            let mkdir = Command::new(&hdc)
+                .arg("shell")
+                .arg("mkdir")
+                .arg("-p")
+                .arg(parent)
+                .output()
+                .await
+                .context("Failed to create OHOS staging directory")?;
+            if !mkdir.status.success() {
+                bail!(
+                    "Failed to create OHOS staging directory: {}{}",
+                    String::from_utf8_lossy(&mkdir.stdout),
+                    String::from_utf8_lossy(&mkdir.stderr)
+                );
+            }
+        }
+
+        let send = Command::new(&hdc)
+            .arg("file")
+            .arg("send")
+            .arg(changed_file)
+            .arg(&staged_target)
+            .output()
+            .await
+            .context("Failed to stage OHOS hotreloaded asset")?;
+        if !send.status.success() {
+            bail!(
+                "Failed to stage OHOS hotreloaded asset {}: {}{}",
+                staged_target.display(),
+                String::from_utf8_lossy(&send.stdout),
+                String::from_utf8_lossy(&send.stderr)
+            );
+        }
+
+        let sandbox_target = dioxus_cli_config::ohos_asset_override_dir().join(bundled_name);
+        let application_id = self.build.bundle_identifier();
+        Self::copy_ohos_staged_asset_to_sandbox(&hdc, &application_id, &staged_target, &sandbox_target)
+            .await?;
+
+        Ok(sandbox_target)
+    }
+
+    async fn copy_ohos_staged_asset_to_sandbox(
+        hdc: &Path,
+        application_id: &str,
+        staged_source: &Path,
+        sandbox_target: &Path,
+    ) -> Result<()> {
+        Self::ensure_ohos_bftpd(hdc, application_id).await?;
+
+        let parent = sandbox_target
+            .parent()
+            .context("Missing OHOS sandbox asset parent directory")?;
+        Self::ensure_ohos_sandbox_dir(hdc, parent).await?;
+
+        let copy = Command::new(hdc)
+            .arg("shell")
+            .arg("ftpget")
+            .arg("-p")
+            .arg(OHOS_BFTPD_PORT.to_string())
+            .arg("-P")
+            .arg("guest")
+            .arg("-u")
+            .arg("anonymous")
+            .arg("localhost")
+            .arg("-s")
+            .arg(staged_source)
+            .arg(sandbox_target)
+            .output()
+            .await
+            .context("Failed to copy staged OHOS asset into sandbox")?;
+
+        if !copy.status.success() {
+            bail!(
+                "Failed to copy OHOS staged asset {} -> {}: {}{}",
+                staged_source.display(),
+                sandbox_target.display(),
+                String::from_utf8_lossy(&copy.stdout),
+                String::from_utf8_lossy(&copy.stderr)
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn ensure_ohos_bftpd(hdc: &Path, application_id: &str) -> Result<()> {
+        let check = Command::new(hdc)
+            .arg("shell")
+            .arg("ps")
+            .arg("-ef")
+            .output()
+            .await
+            .context("Failed to inspect OpenHarmony processes")?;
+        let process_list = format!(
+            "{}{}",
+            String::from_utf8_lossy(&check.stdout),
+            String::from_utf8_lossy(&check.stderr)
+        );
+        if process_list.contains(&format!("bftpd -D -p {OHOS_BFTPD_PORT}")) {
+            return Ok(());
+        }
+
+        let start = Command::new(hdc)
+            .arg("shell")
+            .arg("aa")
+            .arg("process")
+            .arg("-b")
+            .arg(application_id)
+            .arg("-a")
+            .arg("EntryAbility")
+            .arg("-p")
+            .arg(format!("/system/bin/bftpd -D -p {OHOS_BFTPD_PORT}"))
+            .arg("-S")
+            .output()
+            .await
+            .context("Failed to start OpenHarmony bftpd process")?;
+        if !start.status.success() {
+            bail!(
+                "Failed to start OpenHarmony bftpd process: {}{}",
+                String::from_utf8_lossy(&start.stdout),
+                String::from_utf8_lossy(&start.stderr)
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn ensure_ohos_sandbox_dir(hdc: &Path, dir: &Path) -> Result<()> {
+        let create = Command::new(hdc)
+            .arg("shell")
+            .arg("ftpget")
+            .arg("-p")
+            .arg(OHOS_BFTPD_PORT.to_string())
+            .arg("-P")
+            .arg("guest")
+            .arg("-u")
+            .arg("anonymous")
+            .arg("localhost")
+            .arg("-M")
+            .arg(dir)
+            .output()
+            .await
+            .context("Failed creating OpenHarmony sandbox directory")?;
+
+        let stdout = String::from_utf8_lossy(&create.stdout);
+        let stderr = String::from_utf8_lossy(&create.stderr);
+        let already_exists = stdout.contains("File exists") || stderr.contains("File exists");
+        if !create.status.success() && !already_exists {
+            bail!(
+                "Failed to create OpenHarmony sandbox directory {}: {}{}",
+                dir.display(),
+                stdout,
+                stderr
+            );
+        }
+
+        Ok(())
     }
 
     /// Open the native app simply by running its main exe

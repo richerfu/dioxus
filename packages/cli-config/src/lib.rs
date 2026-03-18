@@ -105,8 +105,8 @@ macro_rules! read_env_config {
 pub fn devserver_raw_addr() -> Option<SocketAddr> {
     let port = std::env::var(DEVSERVER_PORT_ENV).ok();
 
-    if cfg!(target_os = "android") {
-        // Since `adb reverse` is used for Android, the 127.0.0.1 will always be
+    if cfg!(any(target_os = "android", target_env = "ohos")) {
+        // Since `adb reverse` is used for Android, and `hdc port-forward` is used for OpenHarmony, the 127.0.0.1 will always be
         // the correct IP address.
         let port = port.unwrap_or("8080".to_string());
         return Some(format!("127.0.0.1:{}", port).parse().unwrap());
@@ -320,6 +320,11 @@ pub fn android_session_cache_dir() -> PathBuf {
 /// The session cache directory for OpenHarmony
 pub fn ohos_session_cache_dir() -> PathBuf {
     PathBuf::from("/data/local/tmp/dx/")
+}
+
+/// The OpenHarmony runtime asset override directory that the app process can read in debug mode.
+pub fn ohos_asset_override_dir() -> PathBuf {
+    PathBuf::from("/data/storage/el2/base/files/dx/")
 }
 
 /// The unique build id for this application, used to disambiguate between different builds of the same
